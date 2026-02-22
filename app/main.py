@@ -1,23 +1,26 @@
 import os
-import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Annotated, AsyncGenerator
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException, Request, Response
-from fastapi.responses import Response
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
-from app.agent import run_agent_async
+from app.agent import run_agent_async, SYSTEM_PROMPT
+from app.crud import delete_session as db_delete_session
+from app.crud import get_or_create_session, load_history, save_turn
+from app.database import get_session, init_db
+from app.scheduler import start_scheduler
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# In-memory session store  (replace with Redis / DB for persistence)
+# DB session dependency shorthand
 # ---------------------------------------------------------------------------
-_sessions: dict[str, list[dict]] = {}
+DB = Annotated[AsyncSession, Depends(get_session)]
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +69,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "TWILIO_AUTH_TOKEN environment variable is not set. "
             "Add it to your .env file or docker-compose environment."
         )
+    if not os.getenv("TWILIO_ACCOUNT_SID"):
+        raise RuntimeError(
+            "TWILIO_ACCOUNT_SID environment variable is not set. "
+            "Add it to your .env file or docker-compose environment."
+        )
+    if not os.getenv("TWILIO_FROM_NUMBER"):
+        raise RuntimeError(
+            "TWILIO_FROM_NUMBER environment variable is not set. "
+            "Add it to your .env file or docker-compose environment."
+        )
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "Add it to your .env file or docker-compose environment."
+        )
+    await init_db()
+    scheduler = start_scheduler()
     yield
+    scheduler.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -88,20 +109,19 @@ def health() -> HealthResponse:
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["agent"])
-async def chat(body: ChatRequest) -> ChatResponse:
+async def chat(body: ChatRequest, db: DB) -> ChatResponse:
     """
     Send a message to the personal agent.
 
     - If **session_id** is omitted a new conversation is created and its ID
       is returned so you can continue the thread on subsequent calls.
-    - The agent uses `claude_agent_sdk` internally, running a full agentic
-      loop (with tools) before returning the final reply.
+    - Conversation history is persisted in Postgres.
     """
-    session_id = body.session_id or str(uuid.uuid4())
-    history = _sessions.get(session_id, [])
+    session = await get_or_create_session(db, body.session_id)
+    history = await load_history(db, session)
 
     try:
-        reply, updated_history = await run_agent_async(
+        reply, _ = await run_agent_async(
             user_message=body.message,
             history=history,
             model=body.model,
@@ -110,14 +130,16 @@ async def chat(body: ChatRequest) -> ChatResponse:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    _sessions[session_id] = updated_history
-    return ChatResponse(reply=reply, session_id=session_id)
+    await save_turn(db, session, body.message, reply)
+    return ChatResponse(reply=reply, session_id=session.id)
 
 
 @app.delete("/sessions/{session_id}", tags=["agent"])
-def delete_session(session_id: str) -> dict:
-    """Clear the conversation history for a session."""
-    _sessions.pop(session_id, None)
+async def delete_session(session_id: str, db: DB) -> dict:
+    """Delete a session and all its message history from the database."""
+    deleted = await db_delete_session(db, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
     return {"deleted": session_id}
 
 
@@ -128,6 +150,7 @@ def delete_session(session_id: str) -> dict:
 @app.post("/whatsapp", tags=["whatsapp"])
 async def whatsapp_webhook(
     request: Request,
+    db: DB,
     Body: str = Form(...),
     From: str = Form(...),
 ) -> Response:
@@ -153,19 +176,26 @@ async def whatsapp_webhook(
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     # Use the sender's WhatsApp number as a stable session key
-    session_id = From  # e.g. "whatsapp:+447700900000"
-    history = _sessions.get(session_id, [])
+    session = await get_or_create_session(db, From)  # e.g. "whatsapp:+447700900000"
+    history = await load_history(db, session)
+
+    # Inject the user's phone number into the system prompt so the agent
+    # can populate phone_number automatically when creating reminders.
+    user_system_prompt = (
+        SYSTEM_PROMPT
+        + f"\n\nThe current user's WhatsApp phone number is: {From}\n"
+        "Always use this phone number when creating reminders for this user."
+    )
 
     try:
-        reply, updated_history = await run_agent_async(
+        reply, _ = await run_agent_async(
             user_message=Body,
             history=history,
+            system_prompt=user_system_prompt,
         )
-    except Exception as exc:  # noqa: BLE001
+        await save_turn(db, session, Body, reply)
+    except Exception:  # noqa: BLE001
         reply = "Sorry, something went wrong. Please try again."
-        updated_history = history
-
-    _sessions[session_id] = updated_history
 
     # Respond with TwiML so Twilio sends the reply back via WhatsApp
     twiml = MessagingResponse()

@@ -8,14 +8,59 @@ from claude_code_sdk.types import AssistantMessage, ResultMessage
 # Default configuration
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "You are a helpful personal assistant. "
-    "Be concise and direct."
-)
+SYSTEM_PROMPT = """\
+You are a helpful personal assistant. Be concise and direct.
 
-# Tools the agent may call.
-# Common built-ins: "Read", "Edit", "Bash", "WebSearch", "TodoRead", "TodoWrite"
-DEFAULT_TOOLS: list[str] = ["Read", "Bash", "WebSearch", "Edit"]
+You have access to MCP tools for managing goals, reminders, and user profile.
+Refer to your skill files in .claude/skills/ for detailed tool documentation.
+
+Key behaviours:
+- Retrieve the user's profile at the start of a conversation to personalise responses.
+- Proactively save personal facts the user mentions (name, job, location, interests, etc.).
+- When creating reminders, ALWAYS use the user's phone number from context.
+- Ask the user's timezone if not known; default to UTC.
+- Always confirm ids and details after creating or updating goals/reminders.
+"""
+
+# Built-in claude tools
+DEFAULT_TOOLS: list[str] = [
+    "WebSearch",
+    # MCP goal tools (server name 'goals' → prefix mcp__goals__)
+    "mcp__goals__set_goal",
+    "mcp__goals__list_goals",
+    "mcp__goals__complete_goal",
+    "mcp__goals__edit_goal",
+    "mcp__goals__delete_goal",
+    "mcp__goals__generate_daily",
+    # MCP reminder tools (server name 'reminders' → prefix mcp__reminders__)
+    "mcp__reminders__set_reminder",
+    "mcp__reminders__list_reminders",
+    "mcp__reminders__edit_reminder",
+    "mcp__reminders__delete_reminder",
+    # MCP memory tools (server name 'memory' → prefix mcp__memory__)
+    "mcp__memory__remember",
+    "mcp__memory__recall",
+    "mcp__memory__forget",
+]
+
+# MCP server config — claude_code_sdk spawns this as a subprocess
+MCP_SERVERS: dict[str, dict] = {
+    "goals": {
+        "command": "python",
+        "args": ["-m", "app.tools.goals_mcp"],
+        "cwd": "/app",
+    },
+    "reminders": {
+        "command": "python",
+        "args": ["-m", "app.tools.reminders_mcp"],
+        "cwd": "/app",
+    },
+    "memory": {
+        "command": "python",
+        "args": ["-m", "app.tools.memory_mcp"],
+        "cwd": "/app",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +72,7 @@ async def run_agent_async(
     history: list[dict] | None = None,
     allowed_tools: list[str] = DEFAULT_TOOLS,
     system_prompt: str = SYSTEM_PROMPT,
-    model: str = "claude-opus-4-5",
+    model: str = "claude-sonnet-4-20250514",
     **_: Any,
 ) -> tuple[str, list[dict]]:
     """
@@ -50,9 +95,10 @@ async def run_agent_async(
         prompt=prompt,
         options=ClaudeAgentOptions(
             allowed_tools=allowed_tools,
-            permission_mode="acceptEdits",  # auto-approve file edits
+            permission_mode="acceptEdits",
             model=model,
             system_prompt=system_prompt,
+            mcp_servers=MCP_SERVERS,
         ),
     ):
         if isinstance(message, AssistantMessage):
@@ -93,10 +139,11 @@ def run_agent(
 async def main() -> None:
     """Interactive demo — runs a single hardcoded prompt and streams output."""
     async for message in query(
-        prompt="Explain agent workflows.",
+        prompt="What goals do I have this week?",
         options=ClaudeAgentOptions(
             allowed_tools=DEFAULT_TOOLS,
             permission_mode="acceptEdits",
+            mcp_servers=MCP_SERVERS,
         ),
     ):
         if isinstance(message, AssistantMessage):
