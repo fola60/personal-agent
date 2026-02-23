@@ -9,10 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
+from sqlalchemy import select
+
 from app.agent import run_agent_async, SYSTEM_PROMPT
 from app.crud import delete_session as db_delete_session
 from app.crud import get_or_create_session, load_history, save_turn
 from app.database import get_session, init_db
+from app.models import Memory
 from app.scheduler import start_scheduler
 
 load_dotenv()
@@ -121,7 +124,7 @@ async def chat(body: ChatRequest, db: DB) -> ChatResponse:
     history = await load_history(db, session)
 
     try:
-        reply, _ = await run_agent_async(
+        reply, _, _usage = await run_agent_async(
             user_message=body.message,
             history=history,
             model=body.model,
@@ -187,13 +190,37 @@ async def whatsapp_webhook(
         "Always use this phone number when creating reminders for this user."
     )
 
+    # Auto-load tier 1 (core) memories into the system prompt
+    tier1_result = await db.execute(
+        select(Memory)
+        .where(Memory.phone_number == From, Memory.tier == 1)
+        .order_by(Memory.category, Memory.key)
+    )
+    tier1_entries = tier1_result.scalars().all()
+    if tier1_entries:
+        mem_lines = []
+        for e in tier1_entries:
+            mem_lines.append(f"  - [{e.category}] {e.key}: {e.value}")
+        user_system_prompt += (
+            "\n\n<user_profile>\n"
+            "Known facts about this user (tier 1 core memories):\n"
+            + "\n".join(mem_lines)
+            + "\n</user_profile>"
+        )
+
     try:
-        reply, _ = await run_agent_async(
+        reply, _, usage = await run_agent_async(
             user_message=Body,
             history=history,
             system_prompt=user_system_prompt,
         )
         await save_turn(db, session, Body, reply)
+
+        # Append token usage summary
+        in_tok = usage.get("input_tokens", 0)
+        out_tok = usage.get("output_tokens", 0)
+        if in_tok or out_tok:
+            reply += f"\n\n_Tokens: {in_tok:,} in / {out_tok:,} out ({in_tok + out_tok:,} total)_"
     except Exception:  # noqa: BLE001
         reply = "Sorry, something went wrong. Please try again."
 

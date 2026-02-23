@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from croniter import croniter
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from twilio.rest import Client as TwilioClient
 
@@ -92,7 +93,7 @@ async def _fire_reminder(reminder: Reminder, db: AsyncSession) -> None:
     from app.agent import run_agent_async
 
     try:
-        reply, _ = await run_agent_async(
+        reply, _, _usage = await run_agent_async(
             user_message=reminder.prompt,
             history=[],
         )
@@ -133,19 +134,51 @@ async def check_reminders() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Daily session reset
+# ---------------------------------------------------------------------------
+
+async def reset_sessions() -> None:
+    """Delete all conversation history. Runs daily at midnight UTC."""
+    from app.models import Message, Session as DBSession
+
+    try:
+        async with _Session() as db:
+            result_msg = await db.execute(delete(Message))
+            result_ses = await db.execute(delete(DBSession))
+            await db.commit()
+            logger.info(
+                "Daily session reset: deleted %d messages and %d sessions.",
+                result_msg.rowcount,
+                result_ses.rowcount,
+            )
+    except Exception:
+        logger.exception("Failed to reset sessions")
+
+
+# ---------------------------------------------------------------------------
 # Scheduler lifecycle
 # ---------------------------------------------------------------------------
 
 def start_scheduler() -> AsyncIOScheduler:
     """Create, configure, and start the APScheduler instance."""
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(job_defaults={"misfire_grace_time": 120})
     scheduler.add_job(
         check_reminders,
-        "interval",
+        trigger="interval",
         seconds=60,
-        id="reminder_poller",
+        id="check_reminders",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        reset_sessions,
+        trigger=CronTrigger(hour=0, minute=0),  # midnight UTC
+        id="daily_session_reset",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.start()
-    logger.info("Reminder scheduler started (polling every 60s)")
+    logger.info("Scheduler started: reminder poller (60s) + daily session reset (midnight UTC)")
     return scheduler

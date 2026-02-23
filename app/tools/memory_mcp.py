@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Memory MCP server — persistent long-term memory for the agent.
+Memory MCP server — two-tiered persistent long-term memory for the agent.
 
-Stores key-value entries organised by category (facts, preferences, notes, etc.)
-that survive conversation resets. Each entry is scoped to a phone number.
+Tier 1 (core): Facts, preferences, profile info. Automatically summarised
+               and loaded into every session. Saved proactively by the agent.
+Tier 2 (vault): Information the user explicitly asks to remember. Only
+                retrieved when the user explicitly asks to recall it.
 
 Tools exposed:
-  remember      – save or update a memory entry
-  recall        – retrieve all memories for a user (optionally filtered by category)
+  remember      – save or update a memory entry (tier 1 or 2)
+  recall        – retrieve memories (tier 1 auto-loaded; tier 2 on-demand)
   forget        – delete a specific memory entry
 """
 import asyncio
@@ -46,9 +48,11 @@ async def list_tools() -> list[types.Tool]:
             name="remember",
             description=(
                 "Save or update a persistent memory entry. "
-                "If a memory with the same key and category already exists for this user, "
-                "its value is replaced. Use this proactively when the user shares personal "
-                "information, preferences, or anything worth remembering long-term."
+                "Tier 1 (core): auto-loaded into every session — use for personal facts "
+                "and preferences the agent should always know. "
+                "Tier 2 (vault): only recalled when explicitly asked — use when the user "
+                "says 'remember this' or asks you to store something specific. "
+                "If a memory with the same key already exists for this user, its value is replaced."
             ),
             inputSchema={
                 "type": "object",
@@ -59,7 +63,7 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "key": {
                         "type": "string",
-                        "description": "Memory key. E.g. 'name', 'job', 'location', 'wake_up_time', 'favourite_food'.",
+                        "description": "Memory key. E.g. 'name', 'job', 'location', 'wifi_password', 'book_recommendation'.",
                     },
                     "value": {
                         "type": "string",
@@ -76,13 +80,28 @@ async def list_tools() -> list[types.Tool]:
                         ),
                         "default": "fact",
                     },
+                    "tier": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "description": (
+                            "Memory tier. "
+                            "1 = core (auto-loaded into every session, for profile info and preferences). "
+                            "2 = vault (only recalled on demand, for things the user explicitly asks to remember). "
+                            "Default: 1."
+                        ),
+                        "default": 1,
+                    },
                 },
                 "required": ["phone_number", "key", "value"],
             },
         ),
         types.Tool(
             name="recall",
-            description="Retrieve all stored memories for a user, optionally filtered by category.",
+            description=(
+                "Retrieve stored memories for a user. "
+                "Filter by tier: tier 1 (core/profile) or tier 2 (vault/on-demand). "
+                "Optionally filter by category as well."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -90,10 +109,20 @@ async def list_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "User's WhatsApp number in Twilio format.",
                     },
+                    "tier": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "description": (
+                            "Filter by tier. "
+                            "1 = core memories (profile, facts, preferences). "
+                            "2 = vault memories (things user asked to remember). "
+                            "Omit to retrieve all."
+                        ),
+                    },
                     "category": {
                         "type": "string",
                         "enum": ["fact", "preference", "note"],
-                        "description": "Filter by category. Omit to retrieve all memories.",
+                        "description": "Filter by category. Omit to retrieve all categories.",
                     },
                 },
                 "required": ["phone_number"],
@@ -132,6 +161,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             key = arguments["key"]
             value = arguments["value"]
             category = arguments.get("category", "fact")
+            tier = arguments.get("tier", 1)
 
             # Upsert: check if key already exists for this user
             result = await db.execute(
@@ -142,38 +172,49 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
             entry = result.scalar_one_or_none()
 
+            tier_label = "core" if tier == 1 else "vault"
             if entry:
                 old_value = entry.value
                 entry.value = value
                 entry.category = category
+                entry.tier = tier
                 await db.commit()
-                text = f"✓ Updated [{category}] {key} = {value} (was: {old_value})"
+                text = f"✓ Updated [{tier_label}/{category}] {key} = {value} (was: {old_value})"
             else:
                 entry = Memory(
-                    phone_number=phone, key=key, value=value, category=category,
+                    phone_number=phone, key=key, value=value,
+                    category=category, tier=tier,
                 )
                 db.add(entry)
                 await db.commit()
-                text = f"✓ Remembered [{category}] {key} = {value}"
+                text = f"✓ Remembered [{tier_label}/{category}] {key} = {value}"
 
         elif name == "recall":
             phone = arguments["phone_number"]
             stmt = (
                 select(Memory)
                 .where(Memory.phone_number == phone)
-                .order_by(Memory.category, Memory.key)
+                .order_by(Memory.tier, Memory.category, Memory.key)
             )
+            if tier := arguments.get("tier"):
+                stmt = stmt.where(Memory.tier == tier)
             if cat := arguments.get("category"):
                 stmt = stmt.where(Memory.category == cat)
 
             entries = (await db.execute(stmt)).scalars().all()
 
             if not entries:
-                text = "No memories stored yet for this user."
+                text = "No memories found."
             else:
+                current_tier = None
                 current_cat = None
                 lines = []
                 for e in entries:
+                    tier_label = "Core" if e.tier == 1 else "Vault"
+                    if e.tier != current_tier:
+                        current_tier = e.tier
+                        current_cat = None
+                        lines.append(f"\n{'='*20} {tier_label} (Tier {e.tier}) {'='*20}")
                     if e.category != current_cat:
                         current_cat = e.category
                         lines.append(f"\n## {current_cat.title()}s")

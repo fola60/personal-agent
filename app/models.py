@@ -133,6 +133,7 @@ class Memory(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone_number: Mapped[str] = mapped_column(String(64), index=True)
     category: Mapped[str] = mapped_column(String(64), default="fact")  # e.g. "fact", "preference", "note"
+    tier: Mapped[int] = mapped_column(default=1, server_default="1")  # 1=auto-loaded, 2=on-demand
     key: Mapped[str] = mapped_column(String(255))       # e.g. "name", "job", "location"
     value: Mapped[str] = mapped_column(Text)             # e.g. "Afolabi", "Software Engineer"
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
