@@ -88,23 +88,36 @@ async def _send_whatsapp(to: str, body: str) -> None:
     logger.info("Sent WhatsApp message to %s (%d chars)", to, len(body))
 
 
+async def _send_telegram(chat_id: int, body: str) -> None:
+    """Send a Telegram message via Bot API."""
+    import httpx
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not set — cannot send Telegram message")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, json={"chat_id": chat_id, "text": body})
+        resp.raise_for_status()
+    logger.info("Sent Telegram message to chat %d (%d chars)", chat_id, len(body))
+
+
+async def _send_reminder_message(to: str, body: str) -> None:
+    """Route outbound reminder to WhatsApp or Telegram based on the session key."""
+    if to.startswith("telegram:"):
+        chat_id = int(to.removeprefix("telegram:"))
+        await _send_telegram(chat_id, body)
+    else:
+        await _send_whatsapp(to, body)
+
+
 async def _fire_reminder(reminder: Reminder, db: AsyncSession) -> None:
-    """Generate an agent message for the reminder and send it."""
-    from app.agent import run_agent_async
-
+    """Send the pre-generated reminder message."""
     try:
-        reply, _, _usage = await run_agent_async(
-            user_message=reminder.prompt,
-            history=[],
-        )
+        await _send_reminder_message(reminder.phone_number, reminder.message)
     except Exception:
-        logger.exception("Agent failed for reminder %d", reminder.id)
-        reply = f"⏰ Reminder: {reminder.title}"
-
-    try:
-        await _send_whatsapp(reminder.phone_number, reply)
-    except Exception:
-        logger.exception("Twilio send failed for reminder %d", reminder.id)
+        logger.exception("Send failed for reminder %d", reminder.id)
         return
 
     # Update last_run_at; disable one-off reminders after firing
