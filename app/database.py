@@ -40,10 +40,26 @@ class Base(DeclarativeBase):
 # ---------------------------------------------------------------------------
 
 async def init_db() -> None:
-    """Create all tables if they don't exist yet."""
+    """Create all tables if they don't exist yet, and seed default categories."""
     async with engine.begin() as conn:
         from app import models  # noqa: F401 – ensures models are registered
         await conn.run_sync(Base.metadata.create_all)
+
+    # Seed default categories if the table is empty
+    from app.models import Category
+    from sqlalchemy import select, func as sa_func
+
+    async with AsyncSessionLocal() as session:
+        count = (await session.execute(select(sa_func.count(Category.id)))).scalar() or 0
+        if count == 0:
+            defaults = [
+                "groceries", "dining", "transport", "rent", "utilities",
+                "entertainment", "health", "shopping", "subscriptions",
+                "income", "transfer", "savings", "education", "other",
+            ]
+            for name in defaults:
+                session.add(Category(name=name, is_default=True))
+            await session.commit()
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

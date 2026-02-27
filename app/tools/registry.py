@@ -367,6 +367,182 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_add_category",
+            "description": "Add a new spending category that can be used for transaction classification.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Category name (lowercase, e.g. 'pets', 'charity').",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_list_categories",
+            "description": "List all available spending categories (default and custom).",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_remove_category",
+            "description": "Remove a custom spending category. Default categories cannot be removed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Category name to remove.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_add_tip",
+            "description": "Add a tip for categorising transactions: when a description contains a pattern, assign a category.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Pattern to match in transaction descriptions (e.g. merchant, keyword).",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Category to assign when pattern matches.",
+                    },
+                },
+                "required": ["phone_number", "pattern", "category"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_list_tips",
+            "description": "List all tips for categorising transactions for a user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
+                },
+                "required": ["phone_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_remove_tip",
+            "description": "Remove a tip for categorising transactions by pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Pattern to remove.",
+                    },
+                },
+                "required": ["phone_number", "pattern"],
+            },
+        },
+    },
+    # ── Budgets ──────────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_set_budget",
+            "description": "Set or update a monthly spending budget for a category.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Category name (must exist — use finance_list_categories to check).",
+                    },
+                    "amount": {
+                        "type": "number",
+                        "description": "Monthly budget amount in euros.",
+                    },
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
+                },
+                "required": ["category", "amount", "phone_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_list_budgets",
+            "description": "List all configured monthly budgets.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_remove_budget",
+            "description": "Remove a monthly budget for a category.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "Category name whose budget to remove.",
+                    },
+                },
+                "required": ["category"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finance_check_budgets",
+            "description": (
+                "Check current month spending against all budgets. "
+                "Shows how much has been spent, the limit, and how much is left or over."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
+                },
+                "required": ["phone_number"],
+            },
+        },
+    },
 ]
 
 

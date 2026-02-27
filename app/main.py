@@ -19,7 +19,7 @@ from app.agent import run_agent_async, SYSTEM_PROMPT, DEFAULT_MODEL
 from app.crud import delete_session as db_delete_session
 from app.crud import get_or_create_session, load_history, save_turn
 from app.database import get_session, init_db, AsyncSessionLocal
-from app.models import Memory
+from app.models import Memory, AIBUser
 from app.scheduler import start_scheduler
 
 load_dotenv()
@@ -348,6 +348,17 @@ async def _handle_telegram_message(chat_id: int, text: str) -> None:
     """Process a Telegram message in the background."""
     session_key = f"telegram:{chat_id}"
 
+    # Handle /aib command
+    if text.strip().lower().startswith("/aib"):
+        url = await _get_truelayer_auth_url(chat_id)
+        msg = (
+            "🔗 Connect your AIB account via TrueLayer:\n"
+            f"{url}\n\n"
+            "After connecting, your transactions will sync automatically."
+        )
+        await _send_telegram(chat_id, msg)
+        return
+
     async with AsyncSessionLocal() as db:
         session = await get_or_create_session(db, session_key)
         history = await load_history(db, session)
@@ -413,3 +424,75 @@ async def _handle_telegram_csv(chat_id: int, file_id: str, caption: str) -> None
     except Exception:
         logger.exception("CSV import failed for chat_id=%s", chat_id)
         await _send_telegram(chat_id, "Sorry, something went wrong importing the CSV. Please try again.")
+
+
+async def _get_truelayer_auth_url(chat_id: int) -> str:
+    """Generate TrueLayer OAuth link for AIB connection."""
+    # These should be set in your .env or docker-compose
+    TRUELAYER_CLIENT_ID = os.getenv("TRUELAYER_CLIENT_ID", "")
+    TRUELAYER_CLIENT_SECRET = os.getenv("TRUELAYER_CLIENT_SECRET", "")
+    TRUELAYER_REDIRECT_URI = os.getenv("TRUELAYER_REDIRECT_URI", "")
+    # You may want to use a random state per user
+    state = f"telegram:{chat_id}"
+    scope = "info accounts transactions"
+    from urllib.parse import quote_plus
+    url = (
+        "https://auth.truelayer.com/?response_type=code"
+        f"&client_id={TRUELAYER_CLIENT_ID}"
+        f"&redirect_uri={TRUELAYER_REDIRECT_URI}"
+        f"&scope={quote_plus(scope)}"
+        "&providers=aib"
+        f"&state={state}"
+    )
+    return url
+
+
+@app.get("/truelayer/callback", tags=["truelayer"])
+async def truelayer_callback(code: str, state: str):
+    """
+    TrueLayer OAuth callback. Exchanges code for tokens and saves user details.
+    """
+    # Exchange code for tokens (pseudo-code, replace with real API call)
+    tokens = await exchange_code_for_tokens(code)
+    # Parse user info from state (e.g. telegram:{chat_id})
+    phone_number = state if state.startswith("telegram:") else None
+    telegram_id = state.split(":", 1)[1] if state.startswith("telegram:") else None
+    # Save to DB
+    async with AsyncSessionLocal() as db:
+        user = AIBUser(
+            phone_number=phone_number,
+            telegram_id=telegram_id,
+            access_token=tokens["access_token"],
+            refresh_token=tokens["refresh_token"],
+            expires_at=tokens["expires_at"],
+            truelayer_user_id=tokens.get("user_id"),
+        )
+        db.add(user)
+        await db.commit()
+    # Optionally notify user (pseudo-code)
+    # await _send_telegram(int(telegram_id), "✅ AIB account connected!")
+    return {"status": "ok"}
+
+async def exchange_code_for_tokens(code: str) -> dict:
+    """Exchange code for tokens using TrueLayer API, including client secret."""
+    TRUELAYER_CLIENT_ID = os.getenv("TRUELAYER_CLIENT_ID", "")
+    TRUELAYER_CLIENT_SECRET = os.getenv("TRUELAYER_CLIENT_SECRET", "")
+    TRUELAYER_REDIRECT_URI = os.getenv("TRUELAYER_REDIRECT_URI", "")
+    url = "https://auth.truelayer.com/connect/token"
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": TRUELAYER_CLIENT_ID,
+        "client_secret": TRUELAYER_CLIENT_SECRET,
+        "redirect_uri": TRUELAYER_REDIRECT_URI,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, data=data)
+        resp.raise_for_status()
+        result = resp.json()
+    return {
+        "access_token": result["access_token"],
+        "refresh_token": result["refresh_token"],
+        "expires_at": result.get("expires_in"),  # You may want to convert to datetime
+        "user_id": result.get("user_id"),
+    }

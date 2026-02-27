@@ -5,9 +5,8 @@ Finance tool handlers — transaction management for the personal agent.
 Tools:
   import_csv  – parse an AIB bank CSV export and store transactions
 
-Categorisation pipeline:
-  1. Keyword-based matching (free, instant, ~60-70% coverage)
-  2. AI batch classification via gpt-4o-mini for remaining "other" rows (~$0.003)
+Categorisation: All transactions are classified by gpt-4o-mini in batches
+of 25 for optimal accuracy and token efficiency.
 """
 import hashlib
 import json
@@ -52,22 +51,27 @@ def _get_openai() -> AsyncOpenAI:
 # Valid categories
 # ---------------------------------------------------------------------------
 
-VALID_CATEGORIES = [
+# Default categories — only used as fallback if DB is unreachable
+_DEFAULT_CATEGORIES = [
     "groceries", "dining", "transport", "rent", "utilities",
     "entertainment", "health", "shopping", "subscriptions",
     "income", "transfer", "savings", "education", "other",
 ]
 
-# ---------------------------------------------------------------------------
-# Standalone DB engine
-# ---------------------------------------------------------------------------
+AI_BATCH_SIZE = 25  # transactions per AI call — balances accuracy vs tokens
 
-_db_url = os.getenv("DATABASE_URL", "")
-if _db_url.startswith("postgresql://"):
-    _db_url = _db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-_engine = create_async_engine(_db_url, pool_pre_ping=True)
-_Session = async_sessionmaker(bind=_engine, class_=AsyncSession, expire_on_commit=False)
+async def _fetch_categories() -> list[str]:
+    """Fetch all category names from the database."""
+    from app.models import Category
+    try:
+        async with _Session() as db:
+            result = await db.execute(select(Category.name))
+            cats = [r[0] for r in result.all()]
+            return cats if cats else _DEFAULT_CATEGORIES
+    except Exception as e:
+        logger.warning("Failed to fetch categories from DB, using defaults: %s", e)
+        return _DEFAULT_CATEGORIES
 
 
 # ---------------------------------------------------------------------------
@@ -77,58 +81,10 @@ _Session = async_sessionmaker(bind=_engine, class_=AsyncSession, expire_on_commi
 # Common AIB description prefixes to clean up
 _PREFIX_RE = re.compile(r"^(VDP-|VDC-|VCR-|DD-|SO-|TFR-|CHQ-)")
 
-# Known merchant → category mappings
-_CATEGORY_MAP: dict[str, str] = {
-    "aldi": "groceries",
-    "lidl": "groceries",
-    "tesco": "groceries",
-    "dunnes": "groceries",
-    "supervalu": "groceries",
-    "centra": "groceries",
-    "spar": "groceries",
-    "spotify": "subscriptions",
-    "netflix": "subscriptions",
-    "disney": "subscriptions",
-    "youtube": "subscriptions",
-    "amazon prime": "subscriptions",
-    "flyefit": "subscriptions",
-    "anthropic": "subscriptions",
-    "openai": "subscriptions",
-    "chatgpt": "subscriptions",
-    "amzn mktp": "shopping",
-    "amazon": "shopping",
-    "irish rail": "transport",
-    "leap card": "transport",
-    "dublin bus": "transport",
-    "luas": "transport",
-    "uber": "transport",
-    "bolt": "transport",
-    "freenow": "transport",
-    "just eat": "dining",
-    "deliveroo": "dining",
-    "mcdonald": "dining",
-    "starbucks": "dining",
-    "costa": "dining",
-    "eir": "utilities",
-    "virgin media": "utilities",
-    "electric ireland": "utilities",
-    "bord gais": "utilities",
-    "three.ie": "utilities",
-}
-
 
 def _clean_description(raw: str) -> str:
     """Remove AIB prefix codes from descriptions."""
     return _PREFIX_RE.sub("", raw).strip()
-
-
-def _guess_category(description: str) -> str:
-    """Guess a spending category from the transaction description."""
-    desc_lower = description.lower()
-    for keyword, category in _CATEGORY_MAP.items():
-        if keyword in desc_lower:
-            return category
-    return "other"
 
 
 def _parse_amount(value: str) -> Decimal | None:
@@ -227,7 +183,7 @@ def _parse_aib_csv(csv_text: str) -> list[dict]:
                 "amount": amount,
                 "balance": balance,
                 "transaction_type": txn_type,
-                "category": _guess_category(clean_desc),
+                "category": "unclassified",
                 "external_id": ext_id,
             }
         else:
@@ -249,29 +205,28 @@ def _parse_aib_csv(csv_text: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# AI batch categorisation (for rows the keyword matcher missed)
+# AI batch categorisation — classifies ALL transactions via gpt-4o-mini
 # ---------------------------------------------------------------------------
 
-async def _ai_categorise_batch(uncategorised: list[dict]) -> dict[int, str]:
+async def _ai_categorise_batch(items: list[dict]) -> dict[int, str]:
     """
-    Send uncategorised transactions to gpt-4o-mini in a single batch.
+    Send a single batch of transactions to gpt-4o-mini for classification.
 
     Args:
-        uncategorised: list of dicts with keys: index, description, amount
+        items: list of dicts with keys: index, description, amount
 
     Returns:
         Mapping of {original_index: category}
     """
-    if not uncategorised:
+    if not items:
         return {}
 
-    lines = []
-    for item in uncategorised:
-        lines.append(f"{item['index']}|{item['description']}|{item['amount']}")
+    categories = await _fetch_categories()
+    lines = [f"{it['index']}|{it['description']}|{it['amount']}" for it in items]
 
     prompt = (
         "Categorise each bank transaction below into exactly one category.\n\n"
-        f"Valid categories: {', '.join(VALID_CATEGORIES)}\n\n"
+        f"Valid categories: {', '.join(categories)}\n\n"
         "Transactions (format: index|description|amount):\n"
         + "\n".join(lines)
         + "\n\nRespond with ONLY a JSON object mapping index (as string) to category. "
@@ -280,15 +235,13 @@ async def _ai_categorise_batch(uncategorised: list[dict]) -> dict[int, str]:
 
     try:
         client = _get_openai()
-        response = await client.chat.completions.create(
+        resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=1000,
+            max_tokens=2000,
         )
-        content = response.choices[0].message.content.strip()
-
-        # Handle markdown code blocks
+        content = resp.choices[0].message.content.strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
@@ -296,11 +249,55 @@ async def _ai_categorise_batch(uncategorised: list[dict]) -> dict[int, str]:
         return {
             int(k): v
             for k, v in result.items()
-            if v in VALID_CATEGORIES
+            if v in categories
         }
     except Exception as e:
-        logger.warning("AI categorisation failed, keeping keyword categories: %s", e)
+        logger.warning("AI categorisation batch failed: %s", e)
         return {}
+
+
+async def _ai_categorise_all(parsed: list[dict]) -> None:
+    """
+    Classify every transaction in *parsed* via AI, mutating each
+    dict's 'category' in place.  Processes in batches of AI_BATCH_SIZE.
+    """
+    all_items = [
+        {"index": i, "description": row["description"], "amount": str(row["amount"])}
+        for i, row in enumerate(parsed)
+    ]
+
+    classified = 0
+    for start in range(0, len(all_items), AI_BATCH_SIZE):
+        batch = all_items[start : start + AI_BATCH_SIZE]
+        results = await _ai_categorise_batch(batch)
+        for item in batch:
+            idx = item["index"]
+            if idx in results:
+                parsed[idx]["category"] = results[idx]
+                classified += 1
+            else:
+                parsed[idx]["category"] = "other"  # fallback
+
+    logger.info(
+        "AI classified %d/%d transactions in %d batch(es)",
+        classified, len(parsed),
+        (len(parsed) + AI_BATCH_SIZE - 1) // AI_BATCH_SIZE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TransactionTip tool handlers
+# ---------------------------------------------------------------------------
+
+async def _fetch_tips(phone_number: str) -> list[dict]:
+    """Fetch all tips for a user."""
+    from app.models import TransactionTip
+    async with _Session() as db:
+        result = await db.execute(
+            select(TransactionTip.pattern, TransactionTip.category)
+            .where(TransactionTip.phone_number == phone_number)
+        )
+        return [dict(pattern=r[0], category=r[1]) for r in result.all()]
 
 
 # ---------------------------------------------------------------------------
@@ -308,10 +305,171 @@ async def _ai_categorise_batch(uncategorised: list[dict]) -> dict[int, str]:
 # ---------------------------------------------------------------------------
 
 async def call_tool(name: str, arguments: dict) -> str:
-    from app.models import Transaction
+    from app.models import Budget, Category, Transaction, TransactionTip
 
     async with _Session() as db:
-        if name == "import_csv":
+        if name == "add_category":
+            cat_name = arguments.get("name", "").strip().lower()
+            if not cat_name:
+                return "✗ Category name is required."
+
+            existing = await db.execute(
+                select(Category).where(Category.name == cat_name)
+            )
+            if existing.scalar_one_or_none():
+                return f"Category '{cat_name}' already exists."
+
+            db.add(Category(name=cat_name, is_default=False))
+            await db.commit()
+            return f"✓ Category '{cat_name}' added."
+
+        elif name == "list_categories":
+            result = await db.execute(select(Category).order_by(Category.name))
+            cats = result.scalars().all()
+            if not cats:
+                return "No categories found."
+            lines = []
+            for c in cats:
+                tag = " (default)" if c.is_default else " (custom)"
+                lines.append(f"  • {c.name}{tag}")
+            return f"Categories ({len(cats)}):\n" + "\n".join(lines)
+
+        elif name == "remove_category":
+            cat_name = arguments.get("name", "").strip().lower()
+            if not cat_name:
+                return "✗ Category name is required."
+
+            result = await db.execute(
+                select(Category).where(Category.name == cat_name)
+            )
+            cat = result.scalar_one_or_none()
+            if not cat:
+                return f"✗ Category '{cat_name}' not found."
+            if cat.is_default:
+                return f"✗ Cannot remove default category '{cat_name}'."
+
+            await db.delete(cat)
+            await db.commit()
+            return f"✓ Category '{cat_name}' removed."
+
+        elif name == "set_budget":
+            cat_name = arguments.get("category", "").strip().lower()
+            amount_str = arguments.get("amount", "")
+            phone_number = arguments.get("phone_number", "")
+
+            if not cat_name:
+                return "\u2717 Category is required."
+            if not phone_number:
+                return "\u2717 phone_number is required."
+
+            try:
+                budget_amount = Decimal(str(amount_str))
+            except (InvalidOperation, ValueError):
+                return f"\u2717 Invalid amount: {amount_str}"
+
+            # Find the category
+            result = await db.execute(
+                select(Category).where(Category.name == cat_name)
+            )
+            cat = result.scalar_one_or_none()
+            if not cat:
+                return f"\u2717 Category '{cat_name}' not found. Use finance_list_categories to see available categories."
+
+            # Upsert: check if budget exists for this category
+            result = await db.execute(
+                select(Budget).where(Budget.category_id == cat.id)
+            )
+            existing = result.scalar_one_or_none()
+            if existing:
+                existing.amount = budget_amount
+                existing.phone_number = phone_number
+            else:
+                db.add(Budget(
+                    category_id=cat.id,
+                    phone_number=phone_number,
+                    amount=budget_amount,
+                ))
+            await db.commit()
+            return f"\u2713 Budget for '{cat_name}' set to \u20ac{budget_amount:.2f}/month."
+
+        elif name == "list_budgets":
+            result = await db.execute(
+                select(Budget, Category.name)
+                .join(Category, Budget.category_id == Category.id)
+                .order_by(Category.name)
+            )
+            rows = result.all()
+            if not rows:
+                return "No budgets set. Use finance_set_budget to create one."
+            lines = []
+            for budget, cat_name in rows:
+                lines.append(f"  \u2022 {cat_name}: \u20ac{budget.amount:.2f}/month")
+            return f"Budgets ({len(rows)}):\n" + "\n".join(lines)
+
+        elif name == "remove_budget":
+            cat_name = arguments.get("category", "").strip().lower()
+            if not cat_name:
+                return "\u2717 Category is required."
+
+            result = await db.execute(
+                select(Budget)
+                .join(Category, Budget.category_id == Category.id)
+                .where(Category.name == cat_name)
+            )
+            budget = result.scalar_one_or_none()
+            if not budget:
+                return f"\u2717 No budget found for '{cat_name}'."
+
+            await db.delete(budget)
+            await db.commit()
+            return f"\u2713 Budget for '{cat_name}' removed."
+
+        elif name == "check_budgets":
+            phone_number = arguments.get("phone_number", "")
+            if not phone_number:
+                return "\u2717 phone_number is required."
+
+            # Get all budgets
+            result = await db.execute(
+                select(Budget, Category.name)
+                .join(Category, Budget.category_id == Category.id)
+                .order_by(Category.name)
+            )
+            budget_rows = result.all()
+            if not budget_rows:
+                return "No budgets set."
+
+            # Get current month spending per category
+            now = datetime.now()
+            month_start = now.replace(day=1).date()
+
+            from sqlalchemy import func as sa_func
+            result = await db.execute(
+                select(Transaction.category, sa_func.sum(sa_func.abs(Transaction.amount)))
+                .where(
+                    Transaction.phone_number == phone_number,
+                    Transaction.transaction_type == "debit",
+                    Transaction.date >= month_start,
+                )
+                .group_by(Transaction.category)
+            )
+            spending = {row[0]: row[1] for row in result.all()}
+
+            lines = []
+            for budget, cat_name in budget_rows:
+                spent = spending.get(cat_name, Decimal("0"))
+                remaining = budget.amount - spent
+                pct = (spent / budget.amount * 100) if budget.amount > 0 else Decimal("0")
+                status = "\u2705" if remaining >= 0 else "\u26a0\ufe0f"
+                lines.append(
+                    f"  {status} {cat_name}: \u20ac{spent:.2f} / \u20ac{budget.amount:.2f} "
+                    f"({pct:.0f}%) — \u20ac{abs(remaining):.2f} {'left' if remaining >= 0 else 'over'}"
+                )
+
+            month_label = now.strftime("%B %Y")
+            return f"Budget report — {month_label}:\n" + "\n".join(lines)
+
+        elif name == "import_csv":
             csv_text = arguments.get("csv_text", "")
             phone_number = arguments.get("phone_number", "")
 
@@ -324,25 +482,12 @@ async def call_tool(name: str, arguments: dict) -> str:
             if not parsed:
                 return "✗ No transactions found in the CSV data."
 
-            # ── Phase 1: keyword categorisation (free, instant) ──
-            # Already done inside _parse_aib_csv via _guess_category
+            # Apply user tips before AI categorisation
+            tips = await _fetch_tips(phone_number)
+            _apply_tips(parsed, phone_number, tips)
 
-            # ── Phase 2: AI categorisation for "other" rows ──
-            uncategorised = [
-                {"index": i, "description": row["description"], "amount": str(row["amount"])}
-                for i, row in enumerate(parsed)
-                if row["category"] == "other" and row["transaction_type"] == "debit"
-            ]
-            if uncategorised:
-                ai_results = await _ai_categorise_batch(uncategorised)
-                for item in uncategorised:
-                    idx = item["index"]
-                    if idx in ai_results:
-                        parsed[idx]["category"] = ai_results[idx]
-                logger.info(
-                    "AI categorised %d/%d uncategorised transactions",
-                    len(ai_results), len(uncategorised),
-                )
+            # Classify remaining transactions via AI in batches
+            await _ai_categorise_all(parsed)
 
             # Check which external_ids already exist to avoid duplicates
             ext_ids = [t["external_id"] for t in parsed if t.get("external_id")]
@@ -404,7 +549,63 @@ async def call_tool(name: str, arguments: dict) -> str:
                 f"{cat_lines}"
             )
 
+        elif name == "add_tip":
+            phone_number = arguments.get("phone_number", "")
+            pattern = arguments.get("pattern", "").strip()
+            category = arguments.get("category", "").strip().lower()
+            if not phone_number or not pattern or not category:
+                return "✗ phone_number, pattern, and category are required."
+
+            # Validate category
+            cats = await _fetch_categories()
+            if category not in cats:
+                return f"✗ Category '{category}' not found. Use finance_list_categories to see available categories."
+
+            db.add(TransactionTip(
+                phone_number=phone_number,
+                pattern=pattern,
+                category=category,
+            ))
+            await db.commit()
+            return f"✓ Tip added: '{pattern}' → {category}"
+
+        elif name == "list_tips":
+            phone_number = arguments.get("phone_number", "")
+            if not phone_number:
+                return "✗ phone_number is required."
+            tips = await _fetch_tips(phone_number)
+            if not tips:
+                return "No tips found. Use finance_add_tip to add one."
+            lines = [f"  • '{t['pattern']}' → {t['category']}" for t in tips]
+            return f"Tips ({len(tips)}):\n" + "\n".join(lines)
+
+        elif name == "remove_tip":
+            phone_number = arguments.get("phone_number", "")
+            pattern = arguments.get("pattern", "").strip()
+            if not phone_number or not pattern:
+                return "✗ phone_number and pattern are required."
+            result = await db.execute(
+                select(TransactionTip)
+                .where(TransactionTip.phone_number == phone_number, TransactionTip.pattern == pattern)
+            )
+            tip = result.scalar_one_or_none()
+            if not tip:
+                return f"✗ Tip '{pattern}' not found."
+            await db.delete(tip)
+            await db.commit()
+            return f"✓ Tip '{pattern}' removed."
+
         else:
             text = f"Unknown tool: {name}"
 
     return text
+
+
+def _apply_tips(transactions: list[dict], phone_number: str, tips: list[dict]) -> None:
+    """Apply user tips to transactions, setting category if pattern matches."""
+    for txn in transactions:
+        desc = txn["description"].lower()
+        for tip in tips:
+            if tip["pattern"].lower() in desc:
+                txn["category"] = tip["category"]
+                break

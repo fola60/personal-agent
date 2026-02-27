@@ -146,6 +146,46 @@ class Memory(Base):
 
 
 # ---------------------------------------------------------------------------
+# Category (extensible spending categories)
+# ---------------------------------------------------------------------------
+
+class Category(Base):
+    """A spending category used for transaction classification."""
+
+    __tablename__ = "categories"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    budget: Mapped["Budget | None"] = relationship("Budget", back_populates="category", uselist=False)
+
+
+# ---------------------------------------------------------------------------
+# Budget (1-to-1 with Category)
+# ---------------------------------------------------------------------------
+
+class Budget(Base):
+    """A monthly spending budget linked to a single category."""
+
+    __tablename__ = "budgets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    category_id: Mapped[int] = mapped_column(ForeignKey("categories.id", ondelete="CASCADE"), unique=True)
+    phone_number: Mapped[str] = mapped_column(String(64), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))  # monthly limit
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    category: Mapped["Category"] = relationship("Category", back_populates="budget")
+
+
+# ---------------------------------------------------------------------------
 # Transaction
 # ---------------------------------------------------------------------------
 
@@ -166,3 +206,39 @@ class Transaction(Base):
     raw_description: Mapped[str] = mapped_column(Text, default="")  # original bank description
     external_id: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)  # dedup key
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# TransactionTip (user-provided tips for categorisation)
+# ---------------------------------------------------------------------------
+
+class TransactionTip(Base):
+    """A user-provided tip for categorising transactions by pattern."""
+
+    __tablename__ = "transaction_tips"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone_number: Mapped[str] = mapped_column(String(64), index=True)
+    pattern: Mapped[str] = mapped_column(String(255))  # e.g. merchant, keyword
+    category: Mapped[str] = mapped_column(String(64))  # must match a valid category
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# AIBUser (stores AIB OAuth details per user)
+# ---------------------------------------------------------------------------
+
+class AIBUser(Base):
+    """Stores AIB OAuth details for a user (via TrueLayer)."""
+
+    __tablename__ = "aib_users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone_number: Mapped[str] = mapped_column(String(64), index=True)
+    telegram_id: Mapped[str] = mapped_column(String(64), index=True, nullable=True)
+    access_token: Mapped[str] = mapped_column(Text)
+    refresh_token: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    truelayer_user_id: Mapped[str] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
