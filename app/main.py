@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -84,6 +85,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if not os.getenv("TELEGRAM_BOT_TOKEN"):
         logger.warning(
             "TELEGRAM_BOT_TOKEN not set — Telegram endpoint will not send replies."
+        )
+    if not os.getenv("TRUELAYER_AUTH_LINK"):
+        logger.warning(
+            "TRUELAYER AUTH LINK not set - Users cannot connect their bank."
         )
     if not os.getenv("DATABASE_URL"):
         raise RuntimeError(
@@ -426,23 +431,24 @@ async def _handle_telegram_csv(chat_id: int, file_id: str, caption: str) -> None
         await _send_telegram(chat_id, "Sorry, something went wrong importing the CSV. Please try again.")
 
 
+from urllib.parse import quote_plus
+
 async def _get_truelayer_auth_url(chat_id: int) -> str:
-    """Generate TrueLayer OAuth link for AIB connection."""
-    # These should be set in your .env or docker-compose
+    """Generate TrueLayer OAuth link for AIB connection, Irish banks only."""
     TRUELAYER_CLIENT_ID = os.getenv("TRUELAYER_CLIENT_ID", "")
-    TRUELAYER_CLIENT_SECRET = os.getenv("TRUELAYER_CLIENT_SECRET", "")
     TRUELAYER_REDIRECT_URI = os.getenv("TRUELAYER_REDIRECT_URI", "")
-    # You may want to use a random state per user
+    # Full scope as before
+    scope = "info accounts balance cards transactions direct_debits standing_orders offline_access"
+    # Only Irish providers
+    providers = "ie-ob-aib ie-ob-boi ie-ob-ptsb ie-ob-revolut"
     state = f"telegram:{chat_id}"
-    scope = "info accounts transactions"
-    from urllib.parse import quote_plus
     url = (
         "https://auth.truelayer.com/?response_type=code"
-        f"&client_id={TRUELAYER_CLIENT_ID}"
-        f"&redirect_uri={TRUELAYER_REDIRECT_URI}"
+        f"&client_id={quote_plus(TRUELAYER_CLIENT_ID)}"
         f"&scope={quote_plus(scope)}"
-        "&providers=aib"
-        f"&state={state}"
+        f"&redirect_uri={quote_plus(TRUELAYER_REDIRECT_URI)}"
+        f"&providers={quote_plus(providers)}"
+        f"&state={quote_plus(state)}"
     )
     return url
 
@@ -464,17 +470,19 @@ async def truelayer_callback(code: str, state: str):
             telegram_id=telegram_id,
             access_token=tokens["access_token"],
             refresh_token=tokens["refresh_token"],
-            expires_at=tokens["expires_at"],
+            expires_at=datetime.now(timezone.utc) + timedelta(
+                seconds=tokens["expires_in"]
+            ),
             truelayer_user_id=tokens.get("user_id"),
         )
         db.add(user)
         await db.commit()
-    # Optionally notify user (pseudo-code)
-    # await _send_telegram(int(telegram_id), "✅ AIB account connected!")
+
+    await _send_telegram(int(telegram_id), "Bank account connected!")
     return {"status": "ok"}
 
 async def exchange_code_for_tokens(code: str) -> dict:
-    """Exchange code for tokens using TrueLayer API, including client secret."""
+    """Exchange code for tokens using TrueLayer Data API (authorization_code grant only)."""
     TRUELAYER_CLIENT_ID = os.getenv("TRUELAYER_CLIENT_ID", "")
     TRUELAYER_CLIENT_SECRET = os.getenv("TRUELAYER_CLIENT_SECRET", "")
     TRUELAYER_REDIRECT_URI = os.getenv("TRUELAYER_REDIRECT_URI", "")
@@ -488,11 +496,23 @@ async def exchange_code_for_tokens(code: str) -> dict:
     }
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, data=data)
-        resp.raise_for_status()
-        result = resp.json()
+        try:
+            resp.raise_for_status()
+            result = resp.json()
+        except httpx.HTTPStatusError as e:
+            # Log and return error details for debugging
+            logger.error(f"TrueLayer token exchange failed: {e.response.text}")
+            raise HTTPException(status_code=resp.status_code, detail={
+                "error": "TrueLayer token exchange failed",
+                "status_code": resp.status_code,
+                "response": resp.text,
+                "request_data": data
+            })
     return {
-        "access_token": result["access_token"],
-        "refresh_token": result["refresh_token"],
-        "expires_at": result.get("expires_in"),  # You may want to convert to datetime
+        "access_token": result.get("access_token"),
+        "refresh_token": result.get("refresh_token"),
+        "expires_in": result.get("expires_in"),
+        "token_type": result.get("token_type"),
+        "scope": result.get("scope"),
         "user_id": result.get("user_id"),
     }
