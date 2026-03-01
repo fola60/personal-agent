@@ -368,6 +368,17 @@ async def _handle_telegram_message(chat_id: int, text: str) -> None:
         await _send_telegram(chat_id, msg)
         return
 
+    # Handle /gmail command
+    if text.strip().lower().startswith("/gmail"):
+        url = _get_gmail_auth_url(chat_id)
+        msg = (
+            "📧 Connect your Gmail account:\n"
+            f"{url}\n\n"
+            "After connecting, I'll be able to read your emails."
+        )
+        await _send_telegram(chat_id, msg)
+        return
+
     async with AsyncSessionLocal() as db:
         session = await get_or_create_session(db, session_key)
         history = await load_history(db, session)
@@ -457,6 +468,25 @@ async def _get_truelayer_auth_url(chat_id: int) -> str:
     return url
 
 
+def _get_gmail_auth_url(chat_id: int) -> str:
+    """Generate Gmail OAuth URL for email connection."""
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "")
+    scope = "https://www.googleapis.com/auth/gmail.readonly"
+    state = f"telegram:{chat_id}"
+    url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        f"client_id={quote_plus(GOOGLE_CLIENT_ID)}"
+        f"&redirect_uri={quote_plus(GOOGLE_REDIRECT_URI)}"
+        "&response_type=code"
+        f"&scope={quote_plus(scope)}"
+        "&access_type=offline"
+        "&prompt=consent"
+        f"&state={quote_plus(state)}"
+    )
+    return url
+
+
 @app.get("/truelayer/callback", tags=["truelayer"])
 async def truelayer_callback(code: str, state: str):
     """
@@ -528,3 +558,119 @@ async def exchange_code_for_tokens(code: str) -> dict:
         "scope": result.get("scope"),
         "user_id": result.get("user_id"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Gmail OAuth
+# ---------------------------------------------------------------------------
+
+@app.get("/gmail/auth", tags=["gmail"])
+async def gmail_auth(state: str):
+    """
+    Generate Gmail OAuth URL for connecting user's email.
+    State should be the user's session key (e.g. telegram:123456789).
+    """
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "")
+    
+    if not GOOGLE_CLIENT_ID or not GOOGLE_REDIRECT_URI:
+        raise HTTPException(status_code=500, detail="Gmail OAuth not configured")
+    
+    # Full read access scope for Gmail
+    scope = "https://www.googleapis.com/auth/gmail.readonly"
+    
+    url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        f"client_id={quote_plus(GOOGLE_CLIENT_ID)}"
+        f"&redirect_uri={quote_plus(GOOGLE_REDIRECT_URI)}"
+        "&response_type=code"
+        f"&scope={quote_plus(scope)}"
+        "&access_type=offline"
+        "&prompt=consent"
+        f"&state={quote_plus(state)}"
+    )
+    return {"auth_url": url}
+
+
+@app.get("/gmail/callback", tags=["gmail"])
+async def gmail_callback(code: str, state: str):
+    """
+    Gmail OAuth callback. Exchanges code for tokens and saves user credentials.
+    """
+    from app.models import GmailUser
+    
+    # Exchange code for tokens
+    tokens = await _exchange_gmail_code(code)
+    
+    # Get user email from Google
+    email = await _get_gmail_user_email(tokens["access_token"])
+    
+    # Parse user info from state (e.g. telegram:{chat_id})
+    phone_number = state if state.startswith("telegram:") else None
+    telegram_id = state.split(":", 1)[1] if state.startswith("telegram:") else None
+    
+    # Save to DB (upsert)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(GmailUser).where(GmailUser.phone_number == phone_number)
+        )
+        user = result.scalar_one_or_none()
+        
+        if user:
+            user.email = email
+            user.access_token = tokens["access_token"]
+            user.refresh_token = tokens.get("refresh_token", user.refresh_token)
+            user.expires_at = datetime.now(timezone.utc) + timedelta(seconds=tokens["expires_in"])
+        else:
+            user = GmailUser(
+                phone_number=phone_number,
+                email=email,
+                access_token=tokens["access_token"],
+                refresh_token=tokens["refresh_token"],
+                expires_at=datetime.now(timezone.utc) + timedelta(seconds=tokens["expires_in"]),
+            )
+            db.add(user)
+        
+        await db.commit()
+    
+    await _send_telegram(int(telegram_id), f"✓ Gmail connected! ({email})")
+    return {"status": "ok", "email": email}
+
+
+async def _exchange_gmail_code(code: str) -> dict:
+    """Exchange authorization code for Gmail tokens."""
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "")
+    
+    url = "https://oauth2.googleapis.com/token"
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+    }
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, data=data)
+        try:
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Gmail token exchange failed: {e.response.text}")
+            raise HTTPException(status_code=resp.status_code, detail={
+                "error": "Gmail token exchange failed",
+                "response": resp.text,
+            })
+
+
+async def _get_gmail_user_email(access_token: str) -> str:
+    """Get the authenticated user's email address."""
+    url = "https://www.googleapis.com/gmail/v1/users/me/profile"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.json()["emailAddress"]

@@ -75,6 +75,7 @@ class Goal(Base):
     __tablename__ = "goals"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone_number: Mapped[str] = mapped_column(String(64), index=True)  # e.g. "telegram:123456"
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(Text, default="")
     period: Mapped[GoalPeriod] = mapped_column(Enum(GoalPeriod, name="goalperiod"))
@@ -284,3 +285,22 @@ class BudgetAlert(Base):
     category: Mapped[str] = mapped_column(String(64))
     month: Mapped[str] = mapped_column(String(7))  # YYYY-MM format
     alerted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# GmailUser (stores Gmail OAuth credentials per user)
+# ---------------------------------------------------------------------------
+
+class GmailUser(Base):
+    """Stores Gmail OAuth credentials for a user."""
+
+    __tablename__ = "gmail_users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone_number: Mapped[str] = mapped_column(String(64), index=True, unique=True)
+    email: Mapped[str] = mapped_column(String(255))
+    access_token: Mapped[str] = mapped_column(Text)
+    refresh_token: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

@@ -35,7 +35,7 @@ async def call_tool(name: str, arguments: dict) -> str:
     from app.models import Memory  # imported here to avoid circular issues at spawn time
 
     async with _Session() as db:
-        if name == "remember":
+        if name == "memory_remember":
             phone = arguments["phone_number"]
             key = arguments["key"]
             value = arguments["value"]
@@ -68,7 +68,7 @@ async def call_tool(name: str, arguments: dict) -> str:
                 await db.commit()
                 text = f"✓ Remembered [{tier_label}/{category}] {key} = {value}"
 
-        elif name == "recall":
+        elif name == "memory_recall":
             phone = arguments["phone_number"]
             stmt = (
                 select(Memory)
@@ -100,7 +100,7 @@ async def call_tool(name: str, arguments: dict) -> str:
                     lines.append(f"  • {e.key}: {e.value}")
                 text = "User memories:" + "\n".join(lines)
 
-        elif name == "forget":
+        elif name == "memory_forget":
             phone = arguments["phone_number"]
             key = arguments["key"]
             result = await db.execute(

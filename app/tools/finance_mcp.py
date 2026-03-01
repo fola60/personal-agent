@@ -130,8 +130,12 @@ async def import_transactions_from_truelayer(phone_number: str, access_token: st
                 except (KeyError, ValueError):
                     txn_date = now.date()
                 
-                amount_data = txn.get("amount", {})
-                amount_value = Decimal(str(amount_data.get("value", 0)))
+                # Handle amount - can be a dict {"value": x, "currency": y} or a direct float
+                amount_raw = txn.get("amount", 0)
+                if isinstance(amount_raw, dict):
+                    amount_value = Decimal(str(amount_raw.get("value", 0)))
+                else:
+                    amount_value = Decimal(str(amount_raw))
                 
                 txn_type = txn.get("transaction_type", "debit").lower()
                 if txn_type == "debit":
@@ -502,6 +506,97 @@ async def call_tool(name: str, arguments: dict) -> str:
             ))
             await db.commit()
             return f"✓ Added recurring expense '{name_arg}' (€{amount:.2f} {frequency}, {category})."
+    
+    elif name == "finance_suggest_recurring":
+        phone_number = arguments.get("phone_number")
+        from collections import defaultdict
+        from app.models import Transaction, RecurringTransaction
+        
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(days=90)).date()
+        
+        async with _Session() as db:
+            # Fetch transactions from last 90 days
+            result = await db.execute(
+                select(Transaction)
+                .where(Transaction.phone_number == phone_number)
+                .where(Transaction.date >= since)
+                .where(Transaction.transaction_type == "debit")
+            )
+            transactions = result.scalars().all()
+            
+            if not transactions:
+                return "No transaction history found. Sync transactions first."
+            
+            # Get already-tracked recurring expenses
+            existing_result = await db.execute(
+                select(RecurringTransaction.description_pattern)
+                .where(RecurringTransaction.phone_number == phone_number)
+                .where(RecurringTransaction.is_active == True)
+            )
+            existing_patterns = {r[0] for r in existing_result.all()}
+            
+            # Group by normalized description
+            groups: dict[str, list] = defaultdict(list)
+            for txn in transactions:
+                pattern = _normalize_description(txn.description)
+                if pattern:
+                    groups[pattern].append({
+                        "date": txn.date,
+                        "amount": float(txn.amount),
+                        "description": txn.description,
+                        "category": txn.category,
+                    })
+            
+            # Find recurring patterns (≥2 occurrences with similar amounts)
+            suggestions = []
+            for pattern, txns in groups.items():
+                if len(txns) < 2:
+                    continue
+                
+                # Skip if already tracked
+                if pattern in existing_patterns:
+                    continue
+                
+                # Calculate average amount
+                amounts = [abs(t["amount"]) for t in txns]
+                avg_amount = sum(amounts) / len(amounts)
+                
+                # Check if amounts are within ±15% tolerance
+                all_similar = all(abs(a - avg_amount) <= avg_amount * 0.15 for a in amounts)
+                if not all_similar:
+                    continue
+                
+                # Determine frequency based on date gaps
+                dates = sorted([t["date"] for t in txns])
+                if len(dates) >= 2:
+                    gaps = [(dates[i+1] - dates[i]).days for i in range(len(dates)-1)]
+                    avg_gap = sum(gaps) / len(gaps)
+                    frequency = "weekly" if avg_gap < 14 else "monthly"
+                else:
+                    frequency = "monthly"
+                
+                last_txn = max(txns, key=lambda t: t["date"])
+                
+                suggestions.append({
+                    "name": last_txn["description"],
+                    "suggested_amount": round(avg_amount, 2),
+                    "frequency": frequency,
+                    "category": last_txn["category"],
+                    "occurrences": len(txns),
+                    "last_seen": last_txn["date"].isoformat(),
+                })
+            
+            if not suggestions:
+                return "No recurring expense patterns found in your transaction history."
+            
+            # Sort by occurrences (most frequent first)
+            suggestions.sort(key=lambda x: x["occurrences"], reverse=True)
+            
+            return json.dumps({
+                "message": f"Found {len(suggestions)} potential recurring expenses",
+                "suggestions": suggestions[:10]  # Top 10
+            })
     
     elif name == "finance_sync_transactions":
         phone_number = arguments.get("phone_number")

@@ -32,7 +32,7 @@ async def call_tool(name: str, arguments: dict) -> str:
     from app.models import Reminder  # imported here to avoid circular issues at spawn time
 
     async with _Session() as db:
-        if name == "set_reminder":
+        if name == "reminders_set_reminder":
             cron_expr = arguments.get("cron_expression")
             run_at_str = arguments.get("run_at")
             tz = arguments.get("timezone", "UTC")
@@ -86,7 +86,7 @@ async def call_tool(name: str, arguments: dict) -> str:
                 f"  Recurring: {'Yes' if is_recurring else 'No'}"
             )
 
-        elif name == "list_reminders":
+        elif name == "reminders_list_reminders":
             stmt = select(Reminder).order_by(Reminder.created_at)
             if phone := arguments.get("phone_number"):
                 stmt = stmt.where(Reminder.phone_number == phone)
@@ -115,7 +115,7 @@ async def call_tool(name: str, arguments: dict) -> str:
                     )
                 text = "\n\n".join(rows)
 
-        elif name == "edit_reminder":
+        elif name == "reminders_edit_reminder":
             reminder = (
                 await db.execute(select(Reminder).where(Reminder.id == arguments["id"]))
             ).scalar_one_or_none()
@@ -164,7 +164,7 @@ async def call_tool(name: str, arguments: dict) -> str:
                     await db.commit()
                     text = f"✓ Reminder {reminder.id} updated:\n" + "\n".join(changes)
 
-        elif name == "delete_reminder":
+        elif name == "reminders_delete_reminder":
             reminder = (
                 await db.execute(select(Reminder).where(Reminder.id == arguments["id"]))
             ).scalar_one_or_none()

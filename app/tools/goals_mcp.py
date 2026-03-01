@@ -32,9 +32,12 @@ _Session = async_sessionmaker(bind=_engine, class_=AsyncSession, expire_on_commi
 async def call_tool(name: str, arguments: dict) -> str:
     from app.models import CompletionStatus, Goal, GoalPeriod  # imported here to avoid circular issues at spawn time
 
+    phone = arguments.get("phone_number", "")
+
     async with _Session() as db:
-        if name == "set_goal":
+        if name == "goals_set_goal":
             goal = Goal(
+                phone_number=phone,
                 name=arguments["name"],
                 description=arguments.get("description", ""),
                 period=GoalPeriod(arguments["period"]),
@@ -50,8 +53,8 @@ async def call_tool(name: str, arguments: dict) -> str:
                 f"  Desc   : {goal.description or '—'}"
             )
 
-        elif name == "list_goals":
-            stmt = select(Goal).order_by(Goal.period, Goal.created_at)
+        elif name == "goals_list_goals":
+            stmt = select(Goal).where(Goal.phone_number == phone).order_by(Goal.period, Goal.created_at)
             if period := arguments.get("period"):
                 stmt = stmt.where(Goal.period == GoalPeriod(period))
             goals = (await db.execute(stmt)).scalars().all()
@@ -68,9 +71,9 @@ async def call_tool(name: str, arguments: dict) -> str:
                     )
                 text = "\n\n".join(rows)
 
-        elif name == "complete_goal":
+        elif name == "goals_complete_goal":
             goal = (
-                await db.execute(select(Goal).where(Goal.id == arguments["id"]))
+                await db.execute(select(Goal).where(Goal.id == arguments["id"], Goal.phone_number == phone))
             ).scalar_one_or_none()
             if not goal:
                 text = f"✗ No goal with id={arguments['id']}"
@@ -79,9 +82,9 @@ async def call_tool(name: str, arguments: dict) -> str:
                 await db.commit()
                 text = f"✓ Goal {goal.id} marked '{goal.completed.value}': {goal.name}"
 
-        elif name == "delete_goal":
+        elif name == "goals_delete_goal":
             goal = (
-                await db.execute(select(Goal).where(Goal.id == arguments["id"]))
+                await db.execute(select(Goal).where(Goal.id == arguments["id"], Goal.phone_number == phone))
             ).scalar_one_or_none()
             if not goal:
                 text = f"✗ No goal with id={arguments['id']}"
@@ -90,9 +93,9 @@ async def call_tool(name: str, arguments: dict) -> str:
                 await db.commit()
                 text = f"✓ Deleted goal {arguments['id']}: {goal.name}"
 
-        elif name == "edit_goal":
+        elif name == "goals_edit_goal":
             goal = (
-                await db.execute(select(Goal).where(Goal.id == arguments["id"]))
+                await db.execute(select(Goal).where(Goal.id == arguments["id"], Goal.phone_number == phone))
             ).scalar_one_or_none()
             if not goal:
                 text = f"✗ No goal with id={arguments['id']}"
@@ -116,10 +119,11 @@ async def call_tool(name: str, arguments: dict) -> str:
                     await db.commit()
                     text = f"✓ Goal {goal.id} updated:\n" + "\n".join(changes)
 
-        elif name == "generate_daily":
+        elif name == "goals_generate_daily":
             weekly = (
                 await db.execute(
                     select(Goal)
+                    .where(Goal.phone_number == phone)
                     .where(Goal.period == GoalPeriod.weekly)
                     .order_by(Goal.created_at)
                 )

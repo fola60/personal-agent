@@ -226,8 +226,83 @@ TOOLS: list[dict[str, Any]] = [
         {
             "type": "function",
             "function": {
+                "name": "finance_suggest_recurring",
+                "description": "Analyze 90 days of transaction history and suggest potential recurring expenses the user might want to track. Returns recommendations based on repeated transaction patterns.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "finance_sync_transactions",
                 "description": "Manually sync/import latest transactions from TrueLayer into local database.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+    # ── Email ────────────────────────────────────────────────────────────
+        {
+            "type": "function",
+            "function": {
+                "name": "email_list_recent",
+                "description": "List recent emails from the user's Gmail inbox. Returns subject, sender, date, and snippet for each email.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "max_results": {"type": "integer", "description": "Maximum number of emails to return (default 10, max 20)."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "email_search",
+                "description": "Search emails by query. Supports Gmail search syntax (from:, subject:, has:attachment, etc.).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "query": {"type": "string", "description": "Search query (e.g. 'from:amazon subject:order', 'is:unread', 'has:attachment')."},
+                        "max_results": {"type": "integer", "description": "Maximum number of results (default 10, max 20)."},
+                    },
+                    "required": ["phone_number", "query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "email_read",
+                "description": "Read the full content of a specific email by its ID. Use email_list_recent or email_search first to get the ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "message_id": {"type": "string", "description": "The email message ID to read."},
+                    },
+                    "required": ["phone_number", "message_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "email_unread_count",
+                "description": "Get the count of unread emails in the user's Gmail inbox.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -246,6 +321,10 @@ TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context (e.g. 'telegram:123456789').",
+                    },
                     "period": {
                         "type": "string",
                         "enum": ["daily", "weekly", "monthly", "yearly"],
@@ -258,7 +337,7 @@ TOOLS: list[dict[str, Any]] = [
                         "default": "",
                     },
                 },
-                "required": ["period", "name"],
+                "required": ["phone_number", "period", "name"],
             },
         },
     },
@@ -270,13 +349,17 @@ TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
                     "period": {
                         "type": "string",
                         "enum": ["daily", "weekly", "monthly", "yearly"],
                         "description": "Filter by period. Omit to list all goals.",
                     }
                 },
-                "required": [],
+                "required": ["phone_number"],
             },
         },
     },
@@ -288,6 +371,10 @@ TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
                     "id": {"type": "integer", "description": "Goal id."},
                     "status": {
                         "type": "string",
@@ -295,7 +382,7 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "New completion status.",
                     },
                 },
-                "required": ["id", "status"],
+                "required": ["phone_number", "id", "status"],
             },
         },
     },
@@ -307,6 +394,10 @@ TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
                     "id": {"type": "integer", "description": "Goal id to edit."},
                     "name": {"type": "string", "description": "New goal name."},
                     "description": {"type": "string", "description": "New description."},
@@ -321,7 +412,7 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "New completion status.",
                     },
                 },
-                "required": ["id"],
+                "required": ["phone_number", "id"],
             },
         },
     },
@@ -333,9 +424,13 @@ TOOLS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
                     "id": {"type": "integer", "description": "Goal id to delete."}
                 },
-                "required": ["id"],
+                "required": ["phone_number", "id"],
             },
         },
     },
@@ -349,7 +444,16 @@ TOOLS: list[dict[str, Any]] = [
                 "from their weekly goals. After calling this, use goals_set_goal with "
                 "period='daily' to create each task."
             ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    }
+                },
+                "required": ["phone_number"],
+            },
         },
     },
     # ── Reminders ────────────────────────────────────────────────────────
@@ -786,6 +890,8 @@ def _get_handler(prefix: str):
             from app.tools.memory_mcp import call_tool
         elif prefix == "finance":
             from app.tools.finance_mcp import call_tool
+        elif prefix == "email":
+            from app.tools.email_mcp import call_tool
         else:
             raise ValueError(f"Unknown tool prefix: {prefix}")
         _HANDLERS[prefix] = call_tool
@@ -797,8 +903,8 @@ async def dispatch_tool(name: str, arguments: dict) -> str:
     Route an OpenAI tool call to the correct handler.
 
     Tool names are formatted as '<prefix>_<tool_name>'.
-    The call_tool functions in each MCP module accept (tool_name, arguments)
-    and return list[TextContent].
+    The call_tool functions in each MCP module accept (name, arguments)
+    and return a string result.
     """
     # Split on first underscore to get prefix
     prefix, _, tool_name = name.partition("_")
@@ -808,7 +914,8 @@ async def dispatch_tool(name: str, arguments: dict) -> str:
 
     try:
         handler = _get_handler(prefix)
-        return await handler(tool_name, arguments)
+        # Pass the full tool name to the handler
+        return await handler(name, arguments)
     except Exception as exc:
         logger.exception("Tool %s failed", name)
         return f"Tool error: {exc}"
