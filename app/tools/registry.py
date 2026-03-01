@@ -16,6 +16,227 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 TOOLS: list[dict[str, Any]] = [
+        # ── TrueLayer Transaction & Balance Tools ─────────────────────────────
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_getall_transactions",
+                "description": "Fetch all transactions for a user using TrueLayer. Refreshes token if expired.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_transactions_recent",
+                "description": "Fetch transactions from the last 6 hours for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_get_balance",
+                "description": "Fetch current account balance for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_get_category",
+                "description": "Fetch transactions by category for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "category": {"type": "string", "description": "Category name."},
+                    },
+                    "required": ["phone_number", "category"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_get_merchant",
+                "description": "Fetch transactions by merchant or description for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "merchant": {"type": "string", "description": "Merchant or description keyword."},
+                    },
+                    "required": ["phone_number", "merchant"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_getby_daterange",
+                "description": "Fetch transactions for a custom date range for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "start_date": {"type": "string", "description": "Start date (YYYY-MM-DD)."},
+                        "end_date": {"type": "string", "description": "End date (YYYY-MM-DD)."},
+                    },
+                    "required": ["phone_number", "start_date", "end_date"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_get_scheduledpayments",
+                "description": "Fetch upcoming scheduled payments (direct debits, standing orders) for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_get_summary",
+                "description": "Fetch monthly or weekly spending summaries for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "period": {"type": "string", "enum": ["weekly", "monthly"], "description": "Summary period."},
+                    },
+                    "required": ["phone_number", "period"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_get_status",
+                "description": "Fetch budget status (remaining, overspent, etc.) for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_get_income",
+                "description": "Fetch income (credit) transactions for a user using TrueLayer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_list_recurring",
+                "description": "List all recurring expenses (subscriptions, bills) the user has set up.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_recurring_status",
+                "description": "Check payment status of recurring expenses for the current month. Shows which bills/subscriptions have been paid vs unpaid.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_remove_recurring",
+                "description": "Remove a recurring expense that the user no longer wants to track.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "pattern": {"type": "string", "description": "The name/pattern of the recurring expense to remove."},
+                    },
+                    "required": ["phone_number", "pattern"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_add_recurring",
+                "description": "Add a recurring expense (subscription, bill, rent, etc.) that the user wants to track. Ask the user for name, amount, and frequency. If category is not provided, ask the user to specify one.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                        "name": {"type": "string", "description": "Name/description of the recurring expense (e.g. 'Netflix', 'Rent', 'Gym membership')."},
+                        "amount": {"type": "number", "description": "Expected amount of the recurring expense."},
+                        "frequency": {"type": "string", "enum": ["weekly", "monthly"], "description": "How often this expense occurs."},
+                        "category": {"type": "string", "description": "Category for this recurring expense. If not inferrable from context, ask the user."},
+                    },
+                    "required": ["phone_number", "name", "amount", "frequency", "category"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "finance_sync_transactions",
+                "description": "Manually sync/import latest transactions from TrueLayer into local database.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone_number": {"type": "string", "description": "User's session key."},
+                    },
+                    "required": ["phone_number"],
+                },
+            },
+        },
     # ── Goals ────────────────────────────────────────────────────────────
     {
         "type": "function",

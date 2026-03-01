@@ -169,6 +169,109 @@ async def reset_sessions() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Budget alert checker
+# ---------------------------------------------------------------------------
+
+async def check_budget_alerts() -> None:
+    """
+    Check all users' budgets against current month spending.
+    Send one-time alert if spending exceeds budget for a category.
+    Runs every 6 hours.
+    """
+    from decimal import Decimal
+    from app.models import Budget, BudgetAlert, Transaction, AIBUser
+    
+    now = datetime.now(timezone.utc)
+    month_str = now.strftime("%Y-%m")
+    month_start = now.replace(day=1).date()
+    
+    try:
+        async with _Session() as db:
+            # Get all users with budgets
+            budget_result = await db.execute(
+                select(Budget.phone_number, Budget.category_id, Budget.amount)
+            )
+            budgets = budget_result.all()
+            
+            if not budgets:
+                return
+            
+            # Get category names
+            from app.models import Category
+            cat_result = await db.execute(select(Category))
+            categories = {c.id: c.name for c in cat_result.scalars().all()}
+            
+            # Group budgets by user
+            user_budgets: dict[str, list] = {}
+            for phone, cat_id, amount in budgets:
+                if phone not in user_budgets:
+                    user_budgets[phone] = []
+                cat_name = categories.get(cat_id, "other")
+                user_budgets[phone].append({"category": cat_name, "amount": amount})
+            
+            # Check each user's spending
+            for phone_number, budget_list in user_budgets.items():
+                # Get this month's transactions
+                txns_result = await db.execute(
+                    select(Transaction)
+                    .where(Transaction.phone_number == phone_number)
+                    .where(Transaction.date >= month_start)
+                    .where(Transaction.transaction_type == "debit")
+                )
+                transactions = txns_result.scalars().all()
+                
+                # Sum spending per category
+                spending: dict[str, Decimal] = {}
+                for txn in transactions:
+                    cat = txn.category or "other"
+                    spending[cat] = spending.get(cat, Decimal(0)) + abs(txn.amount)
+                
+                # Check each budget
+                for budget in budget_list:
+                    cat_name = budget["category"]
+                    budget_amount = budget["amount"]
+                    spent = spending.get(cat_name, Decimal(0))
+                    
+                    if spent > budget_amount:
+                        # Check if alert already sent this month
+                        alert_result = await db.execute(
+                            select(BudgetAlert)
+                            .where(BudgetAlert.phone_number == phone_number)
+                            .where(BudgetAlert.category == cat_name)
+                            .where(BudgetAlert.month == month_str)
+                        )
+                        existing_alert = alert_result.scalar_one_or_none()
+                        
+                        if not existing_alert:
+                            # Send alert
+                            overspent = spent - budget_amount
+                            message = (
+                                f"⚠️ Budget Alert: You've exceeded your {cat_name} budget!\n"
+                                f"Budget: €{budget_amount:.2f}\n"
+                                f"Spent: €{spent:.2f}\n"
+                                f"Over by: €{overspent:.2f}"
+                            )
+                            
+                            try:
+                                await _send_reminder_message(phone_number, message)
+                                logger.info(f"Sent budget alert to {phone_number} for {cat_name}")
+                            except Exception as e:
+                                logger.error(f"Failed to send budget alert to {phone_number}: {e}")
+                                continue
+                            
+                            # Record that we sent the alert
+                            db.add(BudgetAlert(
+                                phone_number=phone_number,
+                                category=cat_name,
+                                month=month_str,
+                            ))
+                            await db.commit()
+    
+    except Exception:
+        logger.exception("Failed to check budget alerts")
+
+
+# ---------------------------------------------------------------------------
 # Scheduler lifecycle
 # ---------------------------------------------------------------------------
 
@@ -192,6 +295,15 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        check_budget_alerts,
+        trigger="interval",
+        hours=6,  # every 6 hours
+        id="check_budget_alerts",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
-    logger.info("Scheduler started: reminder poller (60s) + daily session reset (midnight UTC)")
+    logger.info("Scheduler started: reminder poller (60s) + daily session reset (midnight UTC) + budget alerts (6h)")
     return scheduler

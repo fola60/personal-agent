@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Date, Enum, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import Boolean, DateTime, Date, Enum, ForeignKey, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -242,3 +242,45 @@ class AIBUser(Base):
     truelayer_user_id: Mapped[str] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# ---------------------------------------------------------------------------
+# RecurringTransaction (auto-detected recurring payments/subscriptions)
+# ---------------------------------------------------------------------------
+
+class RecurringTransaction(Base):
+    """Auto-detected recurring transaction pattern (e.g. subscriptions, bills)."""
+
+    __tablename__ = "recurring_transactions"
+    __table_args__ = (
+        UniqueConstraint("phone_number", "description_pattern", name="uq_recurring_phone_pattern"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone_number: Mapped[str] = mapped_column(String(64), index=True)
+    description_pattern: Mapped[str] = mapped_column(String(255))  # normalized merchant/description
+    detected_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))  # typical amount
+    frequency: Mapped[str] = mapped_column(String(32), default="monthly")  # monthly, weekly
+    category: Mapped[str] = mapped_column(String(64), default="subscriptions")
+    is_active: Mapped[bool] = mapped_column(default=True)
+    last_paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# BudgetAlert (tracks one-time budget alerts per category per month)
+# ---------------------------------------------------------------------------
+
+class BudgetAlert(Base):
+    """Tracks budget overage alerts to ensure only one alert per category per month."""
+
+    __tablename__ = "budget_alerts"
+    __table_args__ = (
+        UniqueConstraint("phone_number", "category", "month", name="uq_budget_alert_phone_cat_month"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone_number: Mapped[str] = mapped_column(String(64), index=True)
+    category: Mapped[str] = mapped_column(String(64))
+    month: Mapped[str] = mapped_column(String(7))  # YYYY-MM format
+    alerted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

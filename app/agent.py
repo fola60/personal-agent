@@ -116,6 +116,7 @@ async def run_agent_async(
 
             logger.info("Tool call: %s(%s)", fn_name, fn_args)
             result = await dispatch_tool(fn_name, fn_args)
+            logger.info("Tool call result: %s", result)
 
             messages.append({
                 "role": "tool",

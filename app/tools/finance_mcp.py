@@ -1,3 +1,517 @@
+import httpx
+import json
+import logging
+import os
+from app.models import AIBUser
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Standalone DB engine
+# ---------------------------------------------------------------------------
+
+_db_url = os.getenv("DATABASE_URL", "")
+if _db_url.startswith("postgresql://"):
+    _db_url = _db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+_engine = create_async_engine(_db_url, pool_pre_ping=True)
+_Session = async_sessionmaker(bind=_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+# --- TrueLayer Token Refresh Logic ---
+async def _get_valid_token(phone_number: str) -> str:
+    """Return a valid access token for the user, refreshing if expired."""
+    async with _Session() as db:
+        result = await db.execute(select(AIBUser).where(AIBUser.phone_number == phone_number))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise Exception("No TrueLayer credentials found for user.")
+        now = datetime.now(timezone.utc)
+        if user.expires_at > now:
+            return user.access_token
+        # Refresh token
+        TRUELAYER_CLIENT_ID = os.getenv("TRUELAYER_CLIENT_ID", "")
+        TRUELAYER_CLIENT_SECRET = os.getenv("TRUELAYER_CLIENT_SECRET", "")
+        url = "https://auth.truelayer.com/connect/token"
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": user.refresh_token,
+            "client_id": TRUELAYER_CLIENT_ID,
+            "client_secret": TRUELAYER_CLIENT_SECRET,
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, data=data)
+            resp.raise_for_status()
+            result = resp.json()
+        user.access_token = result["access_token"]
+        user.refresh_token = result.get("refresh_token", user.refresh_token)
+        expires_in = result.get("expires_in", 3600)
+        user.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        await db.commit()
+        return user.access_token
+
+# --- TrueLayer API Helpers ---
+async def _truelayer_get(endpoint: str, access_token: str, params=None):
+    url = f"https://api.truelayer.com/{endpoint}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+
+# --- TrueLayer Transaction Import ---
+async def import_transactions_from_truelayer(phone_number: str, access_token: str) -> int:
+    """
+    Import transactions from TrueLayer into the local database.
+    Called automatically when a user connects their bank account.
+    
+    Returns the count of newly imported transactions.
+    """
+    import hashlib
+    import json
+    import logging
+    from decimal import Decimal
+    from app.models import Transaction
+    
+    logger = logging.getLogger(__name__)
+    
+    # Fetch accounts
+    try:
+        accounts = await _truelayer_get("data/v1/accounts", access_token)
+    except Exception as e:
+        logger.error(f"[import_transactions] Failed to fetch accounts for {phone_number}: {e}")
+        return 0
+    
+    if not accounts.get("results"):
+        logger.warning(f"[import_transactions] No accounts found for {phone_number}")
+        return 0
+    
+    imported_count = 0
+    now = datetime.now(timezone.utc)
+    since = (now - timedelta(days=90)).isoformat()  # Last 90 days
+    
+    async with _Session() as db:
+        for account in accounts["results"]:
+            account_id = account["account_id"]
+            
+            try:
+                txns_response = await _truelayer_get(
+                    f"data/v1/accounts/{account_id}/transactions",
+                    access_token,
+                    params={"from": since}
+                )
+            except Exception as e:
+                logger.error(f"[import_transactions] Failed to fetch transactions for account {account_id}: {e}")
+                continue
+            
+            txns = txns_response.get("results", [])
+            parsed_txns = []
+            
+            for txn in txns:
+                # Create unique external_id from TrueLayer transaction
+                ext_id_raw = f"tl|{account_id}|{txn.get('transaction_id', '')}|{txn.get('timestamp', '')}"
+                ext_id = hashlib.sha256(ext_id_raw.encode()).hexdigest()[:32]
+                
+                # Check if already exists
+                existing = await db.execute(
+                    select(Transaction).where(Transaction.external_id == ext_id)
+                )
+                if existing.scalar_one_or_none():
+                    continue
+                
+                # Parse transaction data
+                try:
+                    txn_date = datetime.fromisoformat(txn["timestamp"].replace("Z", "+00:00")).date()
+                except (KeyError, ValueError):
+                    txn_date = now.date()
+                
+                amount_data = txn.get("amount", {})
+                amount_value = Decimal(str(amount_data.get("value", 0)))
+                
+                txn_type = txn.get("transaction_type", "debit").lower()
+                if txn_type == "debit":
+                    amount_value = -abs(amount_value)  # Expenses are negative
+                else:
+                    amount_value = abs(amount_value)  # Income is positive
+                
+                description = txn.get("description", "Unknown")
+                
+                parsed_txns.append({
+                    "date": txn_date,
+                    "description": description,
+                    "raw_description": json.dumps(txn),
+                    "amount": amount_value,
+                    "balance": None,
+                    "transaction_type": txn_type,
+                    "category": "unclassified",
+                    "external_id": ext_id,
+                })
+            
+            # AI categorize the batch
+            if parsed_txns:
+                await _ai_categorise_all(parsed_txns)
+                
+                # Insert into database
+                for txn_data in parsed_txns:
+                    new_txn = Transaction(
+                        phone_number=phone_number,
+                        date=txn_data["date"],
+                        description=txn_data["description"],
+                        raw_description=txn_data["raw_description"],
+                        amount=txn_data["amount"],
+                        balance=txn_data["balance"],
+                        transaction_type=txn_data["transaction_type"],
+                        category=txn_data["category"],
+                        source="truelayer",
+                        external_id=txn_data["external_id"],
+                    )
+                    db.add(new_txn)
+                    imported_count += 1
+                
+                await db.commit()
+    
+    logger.info(f"[import_transactions] Imported {imported_count} transactions for {phone_number}")
+    return imported_count
+
+
+# --- Recurring Transaction Helpers ---
+def _normalize_description(desc: str) -> str:
+    """
+    Normalize a transaction description for pattern matching.
+    Removes numbers, special chars, lowercases, and strips whitespace.
+    """
+    import re
+    # Remove numbers (like dates, amounts, reference numbers)
+    normalized = re.sub(r'\d+', '', desc)
+    # Remove special characters
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    # Lowercase and strip
+    return ' '.join(normalized.lower().split())
+
+
+async def _check_recurring_status(phone_number: str) -> list[dict]:
+    """
+    Check payment status of all recurring transactions for current month.
+    Uses fuzzy description matching to detect if payment was made.
+    """
+    from app.models import Transaction, RecurringTransaction
+    
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1).date()
+    
+    async with _Session() as db:
+        # Get all active recurring transactions
+        result = await db.execute(
+            select(RecurringTransaction)
+            .where(RecurringTransaction.phone_number == phone_number)
+            .where(RecurringTransaction.is_active == True)
+        )
+        recurring = result.scalars().all()
+        
+        # Get this month's transactions
+        txns_result = await db.execute(
+            select(Transaction)
+            .where(Transaction.phone_number == phone_number)
+            .where(Transaction.date >= month_start)
+            .where(Transaction.transaction_type == "debit")
+        )
+        this_month_txns = txns_result.scalars().all()
+        
+        status_list = []
+        for rec in recurring:
+            # Fuzzy match: check if any transaction description contains the pattern
+            pattern_words = set(rec.description_pattern.split())
+            paid = False
+            paid_date = None
+            paid_amount = None
+            
+            for txn in this_month_txns:
+                txn_normalized = _normalize_description(txn.description)
+                txn_words = set(txn_normalized.split())
+                
+                # Match if at least 50% of pattern words are in transaction
+                if pattern_words and len(pattern_words & txn_words) >= len(pattern_words) * 0.5:
+                    paid = True
+                    paid_date = txn.date.isoformat()
+                    paid_amount = float(txn.amount)
+                    break
+            
+            status_list.append({
+                "name": rec.description_pattern,
+                "expected_amount": float(rec.detected_amount),
+                "frequency": rec.frequency,
+                "category": rec.category,
+                "status": "paid" if paid else "unpaid",
+                "paid_date": paid_date,
+                "paid_amount": paid_amount,
+            })
+        
+        return status_list
+
+
+# --- Tool Handlers ---
+async def call_tool(name: str, arguments: dict) -> str:
+    if name == "finance_getall_transactions":
+        phone_number = arguments.get("phone_number")
+        token = await _get_valid_token(phone_number)
+        # Get accounts
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+        return json.dumps(txns["results"])
+    elif name == "finance_transactions_recent":
+        phone_number = arguments.get("phone_number")
+        logger.info(f"[get_recent_transactions] Called for phone_number={phone_number}")
+        try:
+            token = await _get_valid_token(phone_number)
+            logger.info(f"[get_recent_transactions] Valid token obtained for user {phone_number}: {token[:8]}...")
+        except Exception as e:
+            logger.error(f"[get_recent_transactions] Error getting token for {phone_number}: {e}")
+            return f"Error getting token: {e}"
+        try:
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            logger.info(f"[get_recent_transactions] Accounts response: {accounts}")
+        except Exception as e:
+            logger.error(f"[get_recent_transactions] Error fetching accounts: {e}")
+            return f"Error fetching accounts: {e}"
+        if not accounts.get("results"):
+            logger.warning(f"[get_recent_transactions] No accounts found for user {phone_number}")
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        now = datetime.now(timezone.utc)
+        since = (now - timedelta(hours=6)).isoformat()
+        logger.info(f"[get_recent_transactions] Fetching transactions since {since} for account {account_id}")
+        try:
+            txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token, params={"from": since})
+            logger.info(f"[get_recent_transactions] Transactions response: {txns}")
+        except Exception as e:
+            logger.error(f"[get_recent_transactions] Error fetching transactions: {e}")
+            return f"Error fetching transactions: {e}"
+        txn_count = len(txns.get("results", []))
+        logger.info(f"[get_recent_transactions] Returning {txn_count} transactions for user {phone_number}")
+        return json.dumps(txns["results"])
+    elif name == "finance_get_balance":
+        phone_number = arguments.get("phone_number")
+        token = await _get_valid_token(phone_number)
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        balance = await _truelayer_get(f"data/v1/accounts/{account_id}/balance", token)
+        return json.dumps(balance["results"][0])
+    elif name == "finance_get_category":
+        phone_number = arguments.get("phone_number")
+        category = arguments.get("category")
+        token = await _get_valid_token(phone_number)
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+        filtered = [t for t in txns["results"] if t.get("transaction_category") == category]
+        return json.dumps(filtered)
+    elif name == "finance_get_merchant":
+        phone_number = arguments.get("phone_number")
+        merchant = arguments.get("merchant")
+        token = await _get_valid_token(phone_number)
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+        filtered = [t for t in txns["results"] if merchant.lower() in t.get("description", "").lower()]
+        return json.dumps(filtered)
+    elif name == "finance_getby_daterange":
+        phone_number = arguments.get("phone_number")
+        start_date = arguments.get("start_date")
+        end_date = arguments.get("end_date")
+        token = await _get_valid_token(phone_number)
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token, params={"from": start_date, "to": end_date})
+        return json.dumps(txns["results"])
+    elif name == "finance_get_scheduledpayments":
+        phone_number = arguments.get("phone_number")
+        token = await _get_valid_token(phone_number)
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        payments = await _truelayer_get(f"data/v1/accounts/{account_id}/scheduled_payments", token)
+        return json.dumps(payments["results"])
+    elif name == "finance_get_summary":
+        phone_number = arguments.get("phone_number")
+        period = arguments.get("period")
+        token = await _get_valid_token(phone_number)
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+        now = datetime.now(timezone.utc)
+        if period == "monthly":
+            start = now.replace(day=1).date().isoformat()
+        elif period == "weekly":
+            start = (now - timedelta(days=now.weekday())).date().isoformat()
+        else:
+            return "Invalid period."
+        filtered = [t for t in txns["results"] if t["timestamp"][:10] >= start]
+        total = sum(float(t["amount"]['value']) for t in filtered if t["transaction_type"] == "debit")
+        return json.dumps({"period": period, "start": start, "spending": total, "count": len(filtered)})
+    elif name == "finance_get_status":
+        phone_number = arguments.get("phone_number")
+        # For demo, just return current month spending and balance
+        token = await _get_valid_token(phone_number)
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+        start = datetime.now(timezone.utc).replace(day=1).date().isoformat()
+        filtered = [t for t in txns["results"] if t["timestamp"][:10] >= start]
+        spent = sum(float(t["amount"]['value']) for t in filtered if t["transaction_type"] == "debit")
+        balance = await _truelayer_get(f"data/v1/accounts/{account_id}/balance", token)
+        bal = float(balance["results"][0]["current"])
+        return json.dumps({"month_spent": spent, "current_balance": bal})
+    elif name == "finance_get_income":
+        phone_number = arguments.get("phone_number")
+        token = await _get_valid_token(phone_number)
+        accounts = await _truelayer_get("data/v1/accounts", token)
+        if not accounts["results"]:
+            return "No accounts found."
+        account_id = accounts["results"][0]["account_id"]
+        txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+        credits = [t for t in txns["results"] if t["transaction_type"] == "credit"]
+        return json.dumps(credits)
+    
+    # --- Recurring Expense Tools ---
+    elif name == "finance_list_recurring":
+        phone_number = arguments.get("phone_number")
+        from app.models import RecurringTransaction
+        async with _Session() as db:
+            result = await db.execute(
+                select(RecurringTransaction)
+                .where(RecurringTransaction.phone_number == phone_number)
+                .where(RecurringTransaction.is_active == True)
+            )
+            recurring = result.scalars().all()
+            if not recurring:
+                return "No recurring expenses set up yet. Add one with finance_add_recurring."
+            items = [{
+                "name": r.description_pattern,
+                "amount": float(r.detected_amount),
+                "frequency": r.frequency,
+                "category": r.category,
+                "last_paid": r.last_paid_at.isoformat() if r.last_paid_at else None,
+            } for r in recurring]
+            return json.dumps(items)
+    
+    elif name == "finance_recurring_status":
+        phone_number = arguments.get("phone_number")
+        try:
+            status = await _check_recurring_status(phone_number)
+            if not status:
+                return "No recurring expenses to check. Add some first."
+            paid = sum(1 for s in status if s["status"] == "paid")
+            unpaid = len(status) - paid
+            return json.dumps({
+                "summary": f"{paid} paid, {unpaid} unpaid this month",
+                "details": status
+            })
+        except Exception as e:
+            logger.error(f"[finance_recurring_status] Error: {e}")
+            return f"Error checking recurring status: {e}"
+    
+    elif name == "finance_remove_recurring":
+        phone_number = arguments.get("phone_number")
+        pattern = arguments.get("pattern", "").strip().lower()
+        if not pattern:
+            return "✗ Pattern is required."
+        from app.models import RecurringTransaction
+        async with _Session() as db:
+            result = await db.execute(
+                select(RecurringTransaction)
+                .where(RecurringTransaction.phone_number == phone_number)
+                .where(RecurringTransaction.description_pattern == pattern)
+            )
+            rec = result.scalar_one_or_none()
+            if not rec:
+                return f"✗ Recurring expense '{pattern}' not found."
+            rec.is_active = False
+            await db.commit()
+            return f"✓ Recurring expense '{pattern}' removed."
+    
+    elif name == "finance_add_recurring":
+        phone_number = arguments.get("phone_number")
+        name_arg = arguments.get("name", "").strip()
+        amount = arguments.get("amount")
+        frequency = arguments.get("frequency", "monthly")
+        category = arguments.get("category", "").strip()
+        
+        if not name_arg:
+            return "✗ Name is required."
+        if not amount or amount <= 0:
+            return "✗ Amount must be a positive number."
+        if frequency not in ("weekly", "monthly"):
+            return "✗ Frequency must be 'weekly' or 'monthly'."
+        if not category:
+            return "✗ Category is required. Please ask the user which category this expense belongs to."
+        
+        # Normalize the name for pattern matching
+        pattern = _normalize_description(name_arg)
+        if not pattern:
+            pattern = name_arg.lower()
+        
+        from decimal import Decimal
+        from app.models import RecurringTransaction
+        async with _Session() as db:
+            # Check if already exists
+            result = await db.execute(
+                select(RecurringTransaction)
+                .where(RecurringTransaction.phone_number == phone_number)
+                .where(RecurringTransaction.description_pattern == pattern)
+            )
+            existing = result.scalar_one_or_none()
+            
+            if existing:
+                # Reactivate and update if exists
+                existing.is_active = True
+                existing.detected_amount = Decimal(str(amount))
+                existing.frequency = frequency
+                existing.category = category
+                await db.commit()
+                return f"✓ Updated recurring expense '{name_arg}' (€{amount:.2f} {frequency}, {category})."
+            
+            # Create new
+            db.add(RecurringTransaction(
+                phone_number=phone_number,
+                description_pattern=pattern,
+                detected_amount=Decimal(str(amount)),
+                frequency=frequency,
+                category=category,
+                is_active=True,
+            ))
+            await db.commit()
+            return f"✓ Added recurring expense '{name_arg}' (€{amount:.2f} {frequency}, {category})."
+    
+    elif name == "finance_sync_transactions":
+        phone_number = arguments.get("phone_number")
+        try:
+            token = await _get_valid_token(phone_number)
+            count = await import_transactions_from_truelayer(phone_number, token)
+            return f"✓ Synced {count} new transactions from TrueLayer."
+        except Exception as e:
+            logger.error(f"[finance_sync_transactions] Error: {e}")
+            return f"Error syncing transactions: {e}"
 #!/usr/bin/env python3
 """
 Finance tool handlers — transaction management for the personal agent.
@@ -308,7 +822,144 @@ async def call_tool(name: str, arguments: dict) -> str:
     from app.models import Budget, Category, Transaction, TransactionTip
 
     async with _Session() as db:
-        if name == "add_category":
+        if name == "all":
+            phone_number = arguments.get("phone_number")
+            token = await _get_valid_token(phone_number)
+            # Get accounts
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+            return json.dumps(txns["results"])
+        elif name == "transactions_recent":
+            phone_number = arguments.get("phone_number")
+            logger.info(f"[get_recent_transactions] Called for phone_number={phone_number}")
+            try:
+                token = await _get_valid_token(phone_number)
+                logger.info(f"[get_recent_transactions] Valid token obtained for user {phone_number}: {token[:8]}...")
+            except Exception as e:
+                logger.error(f"[get_recent_transactions] Error getting token for {phone_number}: {e}")
+                return f"Error getting token: {e}"
+            try:
+                accounts = await _truelayer_get("data/v1/accounts", token)
+                logger.info(f"[get_recent_transactions] Accounts response: {accounts}")
+            except Exception as e:
+                logger.error(f"[get_recent_transactions] Error fetching accounts: {e}")
+                return f"Error fetching accounts: {e}"
+            if not accounts.get("results"):
+                logger.warning(f"[get_recent_transactions] No accounts found for user {phone_number}")
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            now = datetime.now(timezone.utc)
+            since = (now - timedelta(hours=6)).isoformat()
+            logger.info(f"[get_recent_transactions] Fetching transactions since {since} for account {account_id}")
+            try:
+                txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token, params={"from": since})
+                logger.info(f"[get_recent_transactions] Transactions response: {txns}")
+            except Exception as e:
+                logger.error(f"[get_recent_transactions] Error fetching transactions: {e}")
+                return f"Error fetching transactions: {e}"
+            txn_count = len(txns.get("results", []))
+            logger.info(f"[get_recent_transactions] Returning {txn_count} transactions for user {phone_number}")
+            return json.dumps(txns["results"])
+        elif name == "balance":
+            phone_number = arguments.get("phone_number")
+            token = await _get_valid_token(phone_number)
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            balance = await _truelayer_get(f"data/v1/accounts/{account_id}/balance", token)
+            return json.dumps(balance["results"][0])
+        elif name == "category":
+            phone_number = arguments.get("phone_number")
+            category = arguments.get("category")
+            token = await _get_valid_token(phone_number)
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+            filtered = [t for t in txns["results"] if t.get("transaction_category") == category]
+            return json.dumps(filtered)
+        elif name == "merchant":
+            phone_number = arguments.get("phone_number")
+            merchant = arguments.get("merchant")
+            token = await _get_valid_token(phone_number)
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+            filtered = [t for t in txns["results"] if merchant.lower() in t.get("description", "").lower()]
+            return json.dumps(filtered)
+        elif name == "daterange":
+            phone_number = arguments.get("phone_number")
+            start_date = arguments.get("start_date")
+            end_date = arguments.get("end_date")
+            token = await _get_valid_token(phone_number)
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token, params={"from": start_date, "to": end_date})
+            return json.dumps(txns["results"])
+        elif name == "scheduledpayments":
+            phone_number = arguments.get("phone_number")
+            token = await _get_valid_token(phone_number)
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            payments = await _truelayer_get(f"data/v1/accounts/{account_id}/scheduled_payments", token)
+            return json.dumps(payments["results"])
+        elif name == "summary":
+            phone_number = arguments.get("phone_number")
+            period = arguments.get("period")
+            token = await _get_valid_token(phone_number)
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+            now = datetime.now(timezone.utc)
+            if period == "monthly":
+                start = now.replace(day=1).date().isoformat()
+            elif period == "weekly":
+                start = (now - timedelta(days=now.weekday())).date().isoformat()
+            else:
+                return "Invalid period."
+            filtered = [t for t in txns["results"] if t["timestamp"][:10] >= start]
+            total = sum(float(t["amount"]['value']) for t in filtered if t["transaction_type"] == "debit")
+            return json.dumps({"period": period, "start": start, "spending": total, "count": len(filtered)})
+        elif name == "status":
+            phone_number = arguments.get("phone_number")
+            # For demo, just return current month spending and balance
+            token = await _get_valid_token(phone_number)
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+            start = datetime.now(timezone.utc).replace(day=1).date().isoformat()
+            filtered = [t for t in txns["results"] if t["timestamp"][:10] >= start]
+            spent = sum(float(t["amount"]['value']) for t in filtered if t["transaction_type"] == "debit")
+            balance = await _truelayer_get(f"data/v1/accounts/{account_id}/balance", token)
+            bal = float(balance["results"][0]["current"])
+            return json.dumps({"month_spent": spent, "current_balance": bal})
+        elif name == "income":
+            phone_number = arguments.get("phone_number")
+            token = await _get_valid_token(phone_number)
+            accounts = await _truelayer_get("data/v1/accounts", token)
+            if not accounts["results"]:
+                return "No accounts found."
+            account_id = accounts["results"][0]["account_id"]
+            txns = await _truelayer_get(f"data/v1/accounts/{account_id}/transactions", token)
+            credits = [t for t in txns["results"] if t["transaction_type"] == "credit"]
+            return json.dumps(credits)
+
+        elif name == "add_category":
             cat_name = arguments.get("name", "").strip().lower()
             if not cat_name:
                 return "✗ Category name is required."
@@ -596,7 +1247,7 @@ async def call_tool(name: str, arguments: dict) -> str:
             return f"✓ Tip '{pattern}' removed."
 
         else:
-            text = f"Unknown tool: {name}"
+            text = f"Unknown finance tool: {name}"
 
     return text
 

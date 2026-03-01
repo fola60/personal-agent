@@ -1,5 +1,9 @@
 import asyncio
 import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 import os
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -478,7 +482,15 @@ async def truelayer_callback(code: str, state: str):
         db.add(user)
         await db.commit()
 
-    await _send_telegram(int(telegram_id), "Bank account connected!")
+    # Import transactions from TrueLayer into local database
+    from app.tools.finance_mcp import import_transactions_from_truelayer
+    try:
+        txn_count = await import_transactions_from_truelayer(phone_number, tokens["access_token"])
+        await _send_telegram(int(telegram_id), f"Bank account connected! Imported {txn_count} transactions.")
+    except Exception as e:
+        logger.error(f"Failed to import transactions for {phone_number}: {e}")
+        await _send_telegram(int(telegram_id), "Bank account connected! (Transaction import failed - we'll retry later)")
+    
     return {"status": "ok"}
 
 async def exchange_code_for_tokens(code: str) -> dict:
