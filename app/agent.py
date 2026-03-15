@@ -45,6 +45,8 @@ Key behaviours:
 - Always confirm ids and details after creating or updating goals/reminders.
 - If the user asks to set a daily goal for the remaining days of this week, call goals_set_daily_goal_for_week.
 - If the user asks to set a daily goal for the remaining days of this month, call goals_set_daily_goal_for_month.
+- If the user tells you their schedule for the day or asks you to set a schedule for the day, call reminders_set_daily_schedule.
+- For daily schedules, include provided task times; if the user does not provide times for some tasks, still call reminders_set_daily_schedule and let it auto-plan times.
 """
 
 # Limit conversation history to keep token usage low

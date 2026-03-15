@@ -567,6 +567,69 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "reminders_set_daily_schedule",
+            "description": (
+                "Create one-off reminders for a day's schedule from multiple tasks. "
+                "If some tasks do not include a time, this tool automatically plans times for them. "
+                "Reminder messages are generated now at creation time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
+                    "schedule_date": {
+                        "type": "string",
+                        "description": "Optional date in YYYY-MM-DD. Defaults to today in the provided timezone.",
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone used for planning and schedule times. Defaults to 'UTC'.",
+                        "default": "UTC",
+                    },
+                    "day_start": {
+                        "type": "string",
+                        "description": "Optional planning window start time in HH:MM (24-hour). Defaults to 09:00.",
+                        "default": "09:00",
+                    },
+                    "day_end": {
+                        "type": "string",
+                        "description": "Optional planning window end time in HH:MM (24-hour). Defaults to 21:00.",
+                        "default": "21:00",
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "description": "Tasks to schedule for the day. Include time when provided by the user.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "description": "Task title.",
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Optional short task details.",
+                                    "default": "",
+                                },
+                                "time": {
+                                    "type": "string",
+                                    "description": "Optional task time in HH:MM (24-hour). Omit to auto-plan.",
+                                },
+                            },
+                            "required": ["title"],
+                        },
+                    },
+                },
+                "required": ["phone_number", "tasks"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "reminders_list_reminders",
             "description": "List reminders, optionally filtered by session key.",
             "parameters": {
