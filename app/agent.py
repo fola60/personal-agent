@@ -43,6 +43,8 @@ Key behaviours:
 - When setting a reminder, generate a complete, friendly message that will be sent when it fires (e.g. "⏰ Time to feed your cat!").
 - Ask the user's timezone if not known; default to UTC.
 - Always confirm ids and details after creating or updating goals/reminders.
+- If the user asks to set a daily goal for the remaining days of this week, call goals_set_daily_goal_for_week.
+- If the user asks to set a daily goal for the remaining days of this month, call goals_set_daily_goal_for_month.
 """
 
 # Limit conversation history to keep token usage low

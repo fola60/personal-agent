@@ -456,6 +456,64 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "goals_set_daily_goal_for_week",
+            "description": (
+                "Create a separate daily goal record for each remaining day in the current week. "
+                "Use when the user asks to set a daily goal for this week."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Base daily goal name to apply to each remaining day.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional shared description applied to each generated daily goal.",
+                        "default": "",
+                    },
+                },
+                "required": ["phone_number", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "goals_set_daily_goal_for_month",
+            "description": (
+                "Create a separate daily goal record for each remaining day in the current month. "
+                "Use when the user asks to set a daily goal for this month."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "The user's session key from context.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Base daily goal name to apply to each remaining day.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional shared description applied to each generated daily goal.",
+                        "default": "",
+                    },
+                },
+                "required": ["phone_number", "name"],
+            },
+        },
+    },
     # ── Reminders ────────────────────────────────────────────────────────
     {
         "type": "function",
